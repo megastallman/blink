@@ -247,7 +247,7 @@ static i64 LoadElfLoadSegment(struct Machine *m, const char *path, void *image,
 
 static bool IsFreebsdExecutable(Elf64_Ehdr_ *ehdr, size_t size) {
   // APE uses the FreeBSD OS ABI too, but never with ET_DYN
-  return Read16(ehdr->type) == ET_DYN_ &&
+  return (Read16(ehdr->type) == ET_DYN_ || Read16(ehdr->type) == ET_EXEC_) &&
          ehdr->ident[EI_OSABI_] == ELFOSABI_FREEBSD_ &&
          ehdr->ident[EI_VERSION_] == 1;
 }
@@ -330,10 +330,11 @@ bool IsSupportedExecutable(const char *path, void *image, size_t size) {
       ExplainWhyItCantBeEmulated(path, "ELF is not AMD64");
       return false;
     }
-    if (IsFreebsdExecutable(ehdr, size)) {
-      ExplainWhyItCantBeEmulated(path, "ELF is FreeBSD executable");
-      return false;
-    }
+    // FreeBSD executables are now supported
+    // if (IsFreebsdExecutable(ehdr, size)) {
+    //   ExplainWhyItCantBeEmulated(path, "ELF is FreeBSD executable");
+    //   return false;
+    // }
     if (IsOpenbsdExecutable(ehdr, size)) {
       ExplainWhyItCantBeEmulated(path, "ELF is OpenBSD executable");
       return false;
@@ -785,6 +786,9 @@ error: unsupported executable; we need:\n\
       LoadFlatExecutable(m, elf->base, prog, map, mapsize, fd);
       execstack = true;
     } else if (READ32(map) == READ32("\177ELF")) {
+      if (IsFreebsdExecutable((Elf64_Ehdr_*)map, mapsize)) {
+        m->system->isfreebsd = true;
+      }
       execstack = LoadElf(m, elf, (Elf64_Ehdr_ *)map, mapsize, fd);
     } else if (READ64(map) == READ64("MZqFpD='") ||
                READ64(map) == READ64("jartsr='")) {

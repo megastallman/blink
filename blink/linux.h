@@ -126,6 +126,7 @@
 #define O_ASYNC_LINUX         0x002000
 #define O_NOATIME_LINUX       0x040000
 #define O_PATH_LINUX          0x200000
+#define O_RESOLVE_LINUX       0x100000
 #define O_LARGEFILE_LINUX     0x008000
 #define O_DSYNC_LINUX         0x001000
 #define __O_SYNC_LINUX        0x100000

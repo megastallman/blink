@@ -907,7 +907,8 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
       if (got == MAP_FAILED && errno == ENOMEM && !mutated) {
         LOGF("host system returned ENOMEM");
         return -1;
-      } else if (got != MAP_FAILED && !want) {
+      }
+      if (got != MAP_FAILED && !want) {
         virt = ToGuest(got);
         unassert(IsValidAddrSize(virt, size));
       } else {

@@ -300,11 +300,13 @@ static void GetOpts(int argc, char *argv[]) {
         FLAG_logpath = optarg_;
         break;
       case 'C':
-#if !defined(DISABLE_OVERLAYS)
+#ifndef DISABLE_OVERLAYS
         FLAG_overlays = optarg_;
-#elif !defined(DISABLE_VFS)
+#endif
+#ifndef DISABLE_VFS
         FLAG_prefix = optarg_;
-#else
+#endif
+#if defined(DISABLE_OVERLAYS) && defined(DISABLE_VFS)
         WriteErrorString(
             "error: overlays and vfs support were both disabled\n");
 #endif

@@ -269,6 +269,7 @@ struct System {
   bool exited;
   bool loaded;
   bool iscosmo;
+  bool isfreebsd;
   bool trapexit;
   bool brkchanged;
   _Atomic(bool) killer;

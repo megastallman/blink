@@ -60,6 +60,7 @@
 #include "blink/endian.h"
 #include "blink/errno.h"
 #include "blink/flag.h"
+#include "blink/flags.h"
 #include "blink/iovs.h"
 #include "blink/limits.h"
 #include "blink/linux.h"
@@ -479,7 +480,40 @@ static int SysFork(struct Machine *m) {
   return Fork(m, 0, 0, 0);
 }
 
-static int SysVfork(struct Machine *m) {
+static int SysFreeBSDpdfork(struct Machine* m, i64 fdpaddr, i32 flags) {
+  int rc;
+  int sv[2];
+  struct Fd* fd;
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == -1) return -1;
+  if ((rc = Fork(m, 0, 0, 0)) > 0) {
+    close(sv[1]);
+    LOCK(&m->system->fds.lock);
+    if ((fd = AddFd(&m->system->fds, sv[0], O_CLOEXEC))) {
+      int guestfd = fd->fildes;
+      UNLOCK(&m->system->fds.lock);
+      if (CopyToUserWrite(m, fdpaddr, &guestfd, 4) == -1) {
+        return -1;
+      }
+    } else {
+      UNLOCK(&m->system->fds.lock);
+      close(sv[0]);
+      return -1;
+    }
+  } else if (!rc) {
+    close(sv[0]);
+    if (dup2(sv[1], 3) == -1) _exit(127);
+    close(sv[1]);
+    LOCK(&m->system->fds.lock);
+    AddFd(&m->system->fds, 3, 0);
+    UNLOCK(&m->system->fds.lock);
+  } else {
+    close(sv[0]);
+    close(sv[1]);
+  }
+  return rc;
+}
+
+static int SysVfork(struct Machine* m) {
   // TODO: Parent should be stopped while child is running.
   return SysFork(m);
 }
@@ -1192,12 +1226,13 @@ static i64 SysMmapImpl(struct Machine *m, i64 virt, i64 size, int prot,
   }
   if (fildes != -1) {
     if ((oflags = GetOflags(m, fildes)) == -1) return -1;
-    if ((oflags & O_ACCMODE) == O_WRONLY ||  //
-        ((prot & PROT_WRITE) &&              //
-         (oflags & O_APPEND)) ||             //
-        ((prot & PROT_WRITE) &&              //
-         (flags & MAP_SHARED_LINUX) &&       //
-         (oflags & O_ACCMODE) != O_RDWR)) {  //
+    if (!(m->system->isfreebsd && (oflags & O_PATH_LINUX)) &&
+        ((oflags & O_ACCMODE) == O_WRONLY ||   //
+         ((prot & PROT_WRITE) &&               //
+          (oflags & O_APPEND)) ||              //
+         ((prot & PROT_WRITE) &&               //
+          (flags & MAP_SHARED_LINUX) &&        //
+          (oflags & O_ACCMODE) != O_RDWR))) {  //
       errno = EACCES;
       return -1;
     }
@@ -1483,11 +1518,21 @@ static int SysUname(struct Machine *m, i64 utsaddr) {
   return CopyToUser(m, utsaddr, &uts, sizeof(uts));
 }
 
-static int SysSocket(struct Machine *m, i32 family, i32 type, i32 protocol) {
-  struct Fd *fd;
+#define SOCK_CLOEXEC_FREEBSD  0x10000000
+#define SOCK_NONBLOCK_FREEBSD 0x20000000
+
+static int SysSocket(struct Machine* m, i32 family, i32 type, i32 protocol) {
+  struct Fd* fd;
   int lim, flags, fildes;
-  flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
-  type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+  if (m->system->isfreebsd) {
+    flags = 0;
+    if (type & SOCK_CLOEXEC_FREEBSD) flags |= SOCK_CLOEXEC_LINUX;
+    if (type & SOCK_NONBLOCK_FREEBSD) flags |= SOCK_NONBLOCK_LINUX;
+    type &= ~(SOCK_CLOEXEC_FREEBSD | SOCK_NONBLOCK_FREEBSD);
+  } else {
+    flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+    type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+  }
   if ((type = XlatSocketType(type)) == -1) return -1;
   if ((family = XlatSocketFamily(family)) == -1) return -1;
   if ((protocol = XlatSocketProtocol(protocol)) == -1) return -1;
@@ -1516,8 +1561,15 @@ static int SysSocketpair(struct Machine *m, i32 family, i32 type, i32 protocol,
   struct Fd *fd;
   u8 fds_linux[2][4];
   int rc, lim, flags, sysflags, fds[2];
-  flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
-  type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+  if (m->system->isfreebsd) {
+    flags = 0;
+    if (type & SOCK_CLOEXEC_FREEBSD) flags |= SOCK_CLOEXEC_LINUX;
+    if (type & SOCK_NONBLOCK_FREEBSD) flags |= SOCK_NONBLOCK_LINUX;
+    type &= ~(SOCK_CLOEXEC_FREEBSD | SOCK_NONBLOCK_FREEBSD);
+  } else {
+    flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+    type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
+  }
   if ((type = XlatSocketType(type)) == -1) return -1;
   if ((family = XlatSocketFamily(family)) == -1) return -1;
   if ((protocol = XlatSocketProtocol(protocol)) == -1) return -1;
@@ -2717,9 +2769,69 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
   return i;
 }
 
-static i64 SysGetdents(struct Machine *m, i32 fildes, i64 addr, i64 size) {
+static i64 GetFreeBSDdents(struct Machine* m, i32 fildes, i64 addr, i64 size,
+                           struct Fd* fd) {
+  i64 i;
+  int reclen;
+  size_t len;
+  struct stat st;
+  struct dirent* ent;
+  u8 rec[512];
+  if (size < 24) return einval();
+  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
+  if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
+  if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
+  if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) return -1;
+  for (i = 0; i + 24 <= size; i += reclen) {
+    long tell;
+    errno = 0;
+    tell = VfsTelldir(fd->dirstream);
+    unassert(tell != -1 || errno == 0);
+    if (!(ent = VfsReaddir(fd->dirstream))) break;
+    len = strlen(ent->d_name);
+    reclen = ROUNDUP(8 + 8 + 2 + 1 + 1 + 4 + len + 1, 8);
+    if (i + reclen > size) {
+      VfsSeekdir(fd->dirstream, tell);
+      break;
+    }
+    memset(rec, 0, reclen);
+    Write64(rec + 0, ent->d_ino);             // d_fileno
+    Write64(rec + 8, tell);                   // d_off
+    Write16(rec + 16, reclen);                // d_reclen
+    Write8(rec + 18, UnXlatDt(ent->d_type));  // d_type
+    // rec[19] = d_pad0 (already 0)
+    Write16(rec + 20, len);  // d_namlen (uint16_t)
+    // rec[22-23] = d_pad1 (already 0)
+    strcpy((char*)rec + 24, ent->d_name);
+    if (CopyToUserWrite(m, addr + i, rec, reclen) == -1) return -1;
+  }
+  return i;
+}
+
+static i64 SysFreeBSDGetdents(struct Machine* m, i32 fildes, i64 addr,
+                              i64 size) {
   i64 rc;
   struct Fd *fd;
+  if (!(fd = GetAndLockFd(m, fildes))) return -1;
+  rc = GetFreeBSDdents(m, fildes, addr, size, fd);
+  UnlockFd(fd);
+  return rc;
+}
+
+static int SysFreeBSDUname(struct Machine* m, i64 addr) {
+  u8 b[5 * 256];
+  memset(b, 0, sizeof(b));
+  strcpy((char*)b + 0 * 256, "FreeBSD");
+  strcpy((char*)b + 1 * 256, "blink");
+  strcpy((char*)b + 2 * 256, "16.0-RELEASE");
+  strcpy((char*)b + 3 * 256, "FreeBSD 16.0-RELEASE");
+  strcpy((char*)b + 4 * 256, "amd64");
+  return CopyToUserWrite(m, addr, b, sizeof(b));
+}
+
+static i64 SysGetdents(struct Machine* m, i32 fildes, i64 addr, i64 size) {
+  i64 rc;
+  struct Fd* fd;
   if (!(fd = GetAndLockFd(m, fildes))) return -1;
   rc = Getdents(m, fildes, addr, size, fd);
   UnlockFd(fd);
@@ -5275,6 +5387,37 @@ static int SysPipe(struct Machine *m, i64 pipefds_addr) {
   return SysPipe2(m, pipefds_addr, 0);
 }
 
+static int SysSysarch(struct Machine* m, int op, i64 parms) {
+  i64 addr;
+  const u8* p;
+  if (op == 129) {  // AMD64_SET_FSBASE
+    if (!(p = (const u8*)SchlepR(m, parms, 8))) return -1;
+    addr = Read64(p);
+    m->fs.base = addr;
+    return 0;
+  } else if (op == 130) {  // AMD64_SET_GSBASE
+    if (!(p = (const u8*)SchlepR(m, parms, 8))) return -1;
+    addr = Read64(p);
+    m->gs.base = addr;
+    return 0;
+  }
+  return 0;
+}
+
+static int SysFreeBSDIssetugid(struct Machine* m) {
+  return 0;
+}
+
+static int SysFreeBSDSigprocmask(struct Machine* m, int how, i64 set,
+                                 i64 oset) {
+  return SysSigprocmask(m, how - 1, set, oset, 8);
+}
+
+static int SysFreeBSDSysarch(struct Machine* m, int op, i64 parms) {
+  SYS_LOGF("sysarch(%d, %#" PRIx64 ")", op, parms);
+  return SysSysarch(m, op, parms);
+}
+
 #ifdef HAVE_EPOLL_PWAIT1
 
 static i32 SysEpollCreate1(struct Machine *m, i32 flags) {
@@ -5442,18 +5585,463 @@ static int SysEpollWait(struct Machine *m, i32 epfd, i64 eventsaddr,
 
 #endif /* HAVE_EPOLL_PWAIT1 */
 
+static void WriteFreeBSDStat(struct Machine* m, i64 addr, struct stat* st) {
+  u8 b[144];
+  memset(b, 0, sizeof(b));
+  Write64(b + 0, st->st_dev);
+  Write64(b + 8, st->st_ino);
+  Write64(b + 16, st->st_nlink);
+  Write16(b + 24, st->st_mode);
+  Write32(b + 28, st->st_uid);
+  Write32(b + 32, st->st_gid);
+  Write64(b + 40, st->st_rdev);
+  Write64(b + 48, st->st_atime);
+#ifdef __linux__
+  Write64(b + 56, st->st_atim.tv_nsec);
+  Write64(b + 64, st->st_mtime);
+  Write64(b + 72, st->st_mtim.tv_nsec);
+  Write64(b + 80, st->st_ctime);
+  Write64(b + 88, st->st_ctim.tv_nsec);
+  Write64(b + 96, st->st_ctime);
+  Write64(b + 104, st->st_ctim.tv_nsec);
+#else
+  Write64(b + 64, st->st_mtime);
+  Write64(b + 80, st->st_ctime);
+  Write64(b + 96, st->st_ctime);
+#endif
+  Write64(b + 112, st->st_size);
+  Write64(b + 120, st->st_blocks);
+  Write32(b + 128, (u32)st->st_blksize);
+  CopyToUserWrite(m, addr, b, 144);
+}
+
+static int SysFreeBSDFstat(struct Machine* m, i32 fd, i64 addr) {
+  int rc;
+  struct stat st;
+  if ((rc = VfsFstat(fd, &st)) != -1) WriteFreeBSDStat(m, addr, &st);
+  return rc;
+}
+
+static int SysFreeBSDStat(struct Machine* m, i64 pathaddr, i64 addr) {
+  int rc;
+  struct stat st;
+  const char* path;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  if ((rc = VfsStat(AT_FDCWD, path, &st, 0)) != -1)
+    WriteFreeBSDStat(m, addr, &st);
+  return rc;
+}
+
+static int SysFreeBSDLstat(struct Machine* m, i64 pathaddr, i64 addr) {
+  int rc;
+  struct stat st;
+  const char* path;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  if ((rc = VfsStat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW)) != -1) {
+    WriteFreeBSDStat(m, addr, &st);
+  }
+  return rc;
+}
+
+static int SysFreeBSDFstatat(struct Machine* m, i32 dirfd, i64 pathaddr,
+                             i64 addr, i32 flags) {
+  int rc;
+  struct stat st;
+  const char* path;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st, flags)) != -1) {
+    WriteFreeBSDStat(m, addr, &st);
+  }
+  return rc;
+}
+
+static int SysFreeBSDThrSelf(struct Machine* m, i64 idaddr) {
+  long tid = m->tid;
+  if (CopyToUserWrite(m, idaddr, &tid, 8) == -1) return -1;
+  return 0;
+}
+
+static int SysFreeBSDThrKill(struct Machine* m, long id, int sig) {
+  return 0;  // stub
+}
+
+static int SysFreeBSDShmOpen2(struct Machine* m, i64 path, int flags, int mode,
+                              i64 shmflags, i64 name) {
+  int sysflags = O_CLOEXEC;
+  if ((flags & 3) == 0) sysflags |= O_ACCMODE;  // O_RDONLY is 0
+  if (flags & 0x0001) sysflags |= O_WRONLY;
+  if (flags & 0x0002) sysflags |= O_RDWR;
+  if (flags & 0x0200) sysflags |= O_CREAT;
+  if (flags & 0x0400) sysflags |= O_TRUNC;
+  if (flags & 0x0800) sysflags |= O_EXCL;
+
+  if (path == 1) {  // SHM_ANON
+#ifdef __linux__
+    int fd = memfd_create("blink", (flags & 0x00100000) ? MFD_CLOEXEC : 0);
+    if (fd != -1) {
+      struct Fd* f;
+      LOCK(&m->system->fds.lock);
+      if ((f = AddFd(&m->system->fds, fd, O_RDWR | (sysflags & O_CLOEXEC)))) {
+        int guestfd = f->fildes;
+        UNLOCK(&m->system->fds.lock);
+        return guestfd;
+      }
+      UNLOCK(&m->system->fds.lock);
+      close(fd);
+      return -1;
+    }
+    return -1;
+#else
+    return eopnotsupp();
+#endif
+  } else {
+    const char* pathname = LoadStr(m, path);
+    if (pathname) {
+      char fixed_path[1024];
+      const char* p = pathname;
+      if (p[0] != '/') {
+        snprintf(fixed_path, sizeof(fixed_path), "/%s", pathname);
+        p = fixed_path;
+      }
+      int fd = shm_open(p, sysflags, mode);
+      if (fd != -1) {
+        struct Fd* f;
+        LOCK(&m->system->fds.lock);
+        if ((f = AddFd(&m->system->fds, fd, sysflags))) {
+          int guestfd = f->fildes;
+          UNLOCK(&m->system->fds.lock);
+          return guestfd;
+        }
+        UNLOCK(&m->system->fds.lock);
+        close(fd);
+        return -1;
+      }
+    }
+    return -1;
+  }
+}
+
+static int SysFreeBSDShmUnlink(struct Machine* m, i64 path) {
+  const char* pathname = LoadStr(m, path);
+  if (pathname) {
+    char fixed_path[1024];
+    const char* p = pathname;
+    if (p[0] != '/') {
+      snprintf(fixed_path, sizeof(fixed_path), "/%s", pathname);
+      p = fixed_path;
+    }
+    return shm_unlink(p);
+  }
+  return -1;
+}
+static int SysFreeBSDUuidgen(struct Machine* m, i64 store, int count) {
+  int i;
+  u8 uuid[16];
+  if (count < 0) return -EINVAL;
+  for (i = 0; i < count; ++i) {
+    if (GetRandom(uuid, 16, 0) != 16) return -EAGAIN;
+    uuid[6] = (uuid[6] & 0x0f) | 0x40; /* version 4 */
+    uuid[8] = (uuid[8] & 0x3f) | 0x80; /* variant 1 */
+    if (CopyToUserWrite(m, store + i * 16, uuid, 16) == -1) return -1;
+  }
+  return 0;
+}
+
+static int SysFreeBSDCapGetMode(struct Machine* m, i64 addr) {
+  u32 mode = 0;
+  if (CopyToUserWrite(m, addr, &mode, 4) == -1) return -1;
+  return 0;
+}
+
+static int SysFreeBSDCapRightsGet(struct Machine* m, i32 fd, i64 addr) {
+  u64 rights[2] = {-1ULL, -1ULL};
+  if (CopyToUserWrite(m, addr, rights, 16) == -1) return -1;
+  return 0;
+}
+
+static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
+                               i64 oldaddr) {
+  int syssig;
+  struct sigaction_linux hand;
+  u8 fbsd_hand[32];
+  if (oldaddr) {
+    LOCK(&m->system->sig_lock);
+    hand = m->system->hands[sig - 1];
+    UNLOCK(&m->system->sig_lock);
+    memset(fbsd_hand, 0, 32);
+    Write64(fbsd_hand + 0, Read64(hand.handler));
+    Write64(fbsd_hand + 8, Read64(hand.flags));
+    Write64(fbsd_hand + 16, Read64(hand.mask));
+    if (CopyToUserWrite(m, oldaddr, fbsd_hand, 24) == -1) return -1;
+  }
+  if (actaddr) {
+    if (CopyFromUserRead(m, fbsd_hand, actaddr, 24) == -1) return -1;
+    memset(&hand, 0, sizeof(hand));
+    Write64(hand.handler, Read64(fbsd_hand + 0));
+    Write64(hand.flags, Read64(fbsd_hand + 8));
+    Write64(hand.mask, Read64(fbsd_hand + 16));
+    LOCK(&m->system->sig_lock);
+    m->system->hands[sig - 1] = hand;
+    if ((syssig = XlatSignal(sig)) != -1 && !IsBlinkSig(m->system, sig)) {
+      struct sigaction syshand;
+      sigfillset(&syshand.sa_mask);
+      syshand.sa_flags = SA_SIGINFO;
+      if (Read64(hand.flags) & SA_NOCLDSTOP_LINUX)
+        syshand.sa_flags |= SA_NOCLDSTOP;
+#ifdef SA_NOCLDWAIT
+      if (Read64(hand.flags) & SA_NOCLDWAIT_LINUX)
+        syshand.sa_flags |= SA_NOCLDWAIT;
+#endif
+      u64 handler = Read64(hand.handler);
+      if (handler == SIG_DFL_LINUX) {
+        syshand.sa_handler = SIG_DFL;
+      } else if (handler == SIG_IGN_LINUX) {
+        syshand.sa_handler = SIG_IGN;
+      } else {
+        syshand.sa_sigaction = OnSignal;
+      }
+      sigaction(syssig, &syshand, 0);
+    }
+    UNLOCK(&m->system->sig_lock);
+  }
+  return 0;
+}
+
+static int SysGetdomainname(struct Machine* m, i64 addr, u64 size) {
+  if (CopyToUserWrite(m, addr, "blink.local", 12) == -1) return -1;
+  return 0;
+}
+
+static int SysSetdomainname(struct Machine* m, i64 addr, u64 size) {
+  return 0;
+}
+
+static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
+                            i64 oldaddr, i64 oldlenaddr, i64 newaddr,
+                            u64 newlen) {
+  int rc = 0;
+  u32 name[2];
+  if (namelen < 2) return einval();
+  if (CopyFromUserRead(m, name, nameaddr, 8) == -1) return -1;
+  if (name[0] == 0 /* CTL_SYSCTL */) {
+    if (name[1] == 3 /* CTL_SYSCTL_NAME2OID */) {
+      char buf[64];
+      if (newlen > sizeof(buf)) return einval();
+      if (CopyFromUserRead(m, buf, newaddr, newlen) == -1) return -1;
+      buf[sizeof(buf) - 1] = 0;
+      if (!sizeof(buf)) return einval();
+      int oid[2];
+      if (!strcmp(buf, "kern.ostype")) {
+        oid[0] = 1;
+        oid[1] = 1;
+      } else if (!strcmp(buf, "kern.osrelease")) {
+        oid[0] = 1;
+        oid[1] = 2;
+      } else if (!strcmp(buf, "kern.version")) {
+        oid[0] = 1;
+        oid[1] = 4;
+      } else if (!strcmp(buf, "kern.hostname")) {
+        oid[0] = 1;
+        oid[1] = 10;
+      } else if (!strcmp(buf, "kern.osreldate")) {
+        oid[0] = 1;
+        oid[1] = 24;
+      } else if (!strcmp(buf, "kern.arnd")) {
+        oid[0] = 1;
+        oid[1] = 37;
+      } else if (!strcmp(buf, "kern.domainname")) {
+        oid[0] = 1;
+        oid[1] = 22;
+      } else {
+        return enoent();
+      }
+      if (oldaddr) {
+        if (CopyToUserWrite(m, oldaddr, oid, sizeof(oid)) == -1) return -1;
+        if (oldlenaddr) {
+          u64 len = sizeof(oid);
+          if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+        }
+      }
+      return 0;
+    }
+  } else if (name[0] == 1 /* CTL_KERN */) {
+    if (name[1] == 1 /* KERN_OSTYPE */) {
+      if (oldaddr && CopyToUserWrite(m, oldaddr, "FreeBSD", 8) == -1) return -1;
+      return 0;
+    }
+    if (name[1] == 2 /* KERN_OSRELEASE */) {
+      if (oldaddr && CopyToUserWrite(m, oldaddr, "16.0-RELEASE", 13) == -1)
+        return -1;
+      return 0;
+    }
+    if (name[1] == 4 /* KERN_VERSION */) {
+      if (oldaddr &&
+          CopyToUserWrite(
+              m, oldaddr,
+              "FreeBSD 16.0-RELEASE 6666666: Mon Jan 01 00:00:00 UTC 2024     "
+              "root@blink.local:/usr/obj/usr/src/amd64.amd64/sys/GENERIC",
+              120) == -1)
+        return -1;
+      return 0;
+    }
+    if (name[1] == 10 /* KERN_HOSTNAME */) {
+      if (oldaddr && CopyToUserWrite(m, oldaddr, "blink.local", 12) == -1)
+        return -1;
+      return 0;
+    }
+    if (name[1] == 22 /* KERN_DOMAINNAME */) {
+      if (oldaddr && CopyToUserWrite(m, oldaddr, "blink.local", 12) == -1)
+        return -1;
+      return 0;
+    }
+    if (name[1] == 24 /* KERN_OSRELDATE */) {
+      u32 rel = 1302000;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &rel, 4) == -1) return -1;
+      return 0;
+    }
+    if (name[1] == 37 /* KERN_ARND */) {
+      if (oldaddr) {
+        u64 size;
+        if (oldlenaddr) {
+          u8 lenbuf[8];
+          if (CopyFromUserRead(m, lenbuf, oldlenaddr, 8) == -1) return -1;
+          size = Read64(lenbuf);
+          if (size > 256) size = 256;
+        } else {
+          size = 32;
+        }
+        void* buf = malloc(size);
+        if (!buf) return -1;
+        GetRandom(buf, size, GRND_NONBLOCK_LINUX);
+        rc = CopyToUserWrite(m, oldaddr, buf, size);
+        free(buf);
+        if (rc == -1) return -1;
+      }
+      return 0;
+    }
+    if (name[1] == 33 /* KERN_USRSTACK */) {
+      if (oldaddr) {
+        u64 usrstack = 0x800000000000;
+        if (CopyToUserWrite(m, oldaddr, &usrstack, 8) == -1) return -1;
+      }
+      return 0;
+    }
+  } else if (name[0] == 6 /* CTL_HW */) {
+    if (name[1] == 1 /* HW_MACHINE */) {
+      if (oldaddr && CopyToUserWrite(m, oldaddr, "amd64", 6) == -1) return -1;
+      return 0;
+    }
+    if (name[1] == 2 /* HW_MODEL */) {
+      if (oldaddr &&
+          CopyToUserWrite(m, oldaddr,
+                          "Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz", 37) == -1)
+        return -1;
+      return 0;
+    }
+    if (name[1] == 3 /* HW_NCPU */) {
+      u32 ncpu = 1;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &ncpu, 4) == -1) return -1;
+      return 0;
+    }
+  }
+  fprintf(stderr, "missing freebsd sysctl %d.%d\n", name[0], name[1]);
+  return enosys();
+}
+
+static i64 SysFreeBSDGetdirentries(struct Machine* m, i32 fd, i64 buf,
+                                   u32 count, i64 basepaddr) {
+  i64 rc = SysFreeBSDGetdents(m, fd, buf, count);
+  if (rc >= 0 && basepaddr) {
+    struct Fd* f;
+    if ((f = GetAndLockFd(m, fd))) {
+      long tell = 0;
+      if (f->dirstream) tell = VfsTelldir(f->dirstream);
+      u8 b[8];
+      Write64(b, tell);
+      CopyToUserWrite(m, basepaddr, b, 8);
+      UnlockFd(f);
+    }
+  }
+  return rc;
+}
+
+static i64 SysCopyFileRange(struct Machine* m, i32 fd_in, i64 off_in,
+                            i32 fd_out, i64 off_out, u64 len, u32 flags) {
+  u8* buf;
+  ssize_t rc;
+  u64 toto = 0;
+  i64 offIn = 0;
+  i64 offOut = 0;
+  size_t chunk, maxchunk = 16384;
+  u8 *offInP = 0, *offOutP = 0;
+  if (flags) return einval();
+  if (CheckFdAccess(m, fd_in, false, EBADF) == -1) return -1;
+  if (CheckFdAccess(m, fd_out, true, EBADF) == -1) return -1;
+  if (off_in && !(offInP = (u8*)SchlepRW(m, off_in, 8))) return -1;
+  if (off_out && !(offOutP = (u8*)SchlepRW(m, off_out, 8))) return -1;
+  if (!(buf = (u8*)AddToFreeList(m, malloc(maxchunk)))) return -1;
+  if (offInP) {
+    offIn = Read64(offInP);
+    if (offIn < 0) return einval();
+    if (offIn + len < len || offIn + len > NUMERIC_MAX(off_t)) {
+      return eoverflow();
+    }
+  }
+  if (offOutP) {
+    offOut = Read64(offOutP);
+    if (offOut < 0) return einval();
+    if (offOut + len < len || offOut + len > NUMERIC_MAX(off_t)) {
+      return eoverflow();
+    }
+  }
+  while (toto < len) {
+    chunk = MIN(len - toto, maxchunk);
+    if (offInP) {
+      rc = VfsPread(fd_in, buf, chunk, offIn + toto);
+    } else {
+      rc = VfsRead(fd_in, buf, chunk);
+    }
+    if (rc == -1) {
+      if (!toto) return -1;
+      break;
+    }
+    if (rc == 0) break;
+    if (offOutP) {
+      rc = VfsPwrite(fd_out, buf, rc, offOut + toto);
+    } else {
+      rc = VfsWrite(fd_out, buf, rc);
+    }
+    if (rc == -1) {
+      if (!toto) return -1;
+      break;
+    }
+    toto += rc;
+  }
+  if (offInP) Write64(offInP, offIn + toto);
+  if (offOutP) Write64(offOutP, offOut + toto);
+  return toto;
+}
+
 void OpSyscall(P) {
   size_t mark;
   u64 ax, di, si, dx, r0, r8, r9;
   unassert(!m->nofault);
-  if (Get64(m->ax) == 0xE4) {
+  ax = Get64(m->ax);
+  if (ax == 0xE4 || (m->system->isfreebsd && ax == 232)) {
     // clock_gettime() is
     //   1) called frequently,
     //   2) latency sensitive, and
     //   3) usually implemented as a VDSO.
     // Therefore we exempt it from system call tracing.
     ax = SysClockGettime(m, Get64(m->di), Get64(m->si));
-    Put64(m->ax, ax != -1 ? ax : -(XlatErrno(errno) & 0xfff));
+    if (ax == -1) {
+      if (m->system->isfreebsd) {
+        ax = -XlatErrnoToFreeBSD(errno);
+      } else {
+        ax = -(XlatErrno(errno) & 0xfff);
+      }
+    }
+    Put64(m->ax, ax);
     return;
   }
   STATISTIC(++syscalls);
@@ -5481,6 +6069,294 @@ void OpSyscall(P) {
   mark = m->freelist.n;
   m->interrupted = false;
   ax = Get64(m->ax);
+  // FreeBSD syscall number translation
+  if (m->system->isfreebsd) {
+    if (ax != 232 && ax != 340) {
+      SYS_LOGF("FBSDRAX %" PRIu64 " di=%#" PRIx64 " si=%#" PRIx64
+               " dx=%#" PRIx64 " r10=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64,
+               ax, Get64(m->di), Get64(m->si), Get64(m->dx), Get64(m->r10),
+               Get64(m->r8), Get64(m->r9));
+    }
+    switch (ax) {
+      case 1:
+        ax = 0x3c;
+        break;  // exit
+      case 2:
+        ax = 0x39;
+        break;  // fork
+      case 3:
+        ax = 0x00;
+        break;  // read
+      case 4:
+        ax = 0x01;
+        break;  // write
+      case 14:
+        ax = 0x85;
+        break;  // mknod
+      case 15:
+        ax = 0x5a;
+        break;  // chmod
+      case 16:
+        ax = 0x5c;
+        break;  // chown
+      case 17:
+        ax = 0x0c;
+        break;  // break -> brk
+      case 18:
+        ax = 0x301;
+        break;  // getfsstat -> stub?
+      case 19:
+        ax = 0x08;
+        break;  // lseek
+      case 5:
+        ax = 0x02;
+        break;  // open
+      case 120:
+        ax = 0x13;
+        break;  // readv
+      case 121:
+        ax = 0x14;
+        break;  // writev
+      case 499:
+        ax = 0x101;
+        break;  // openat
+      case 490:
+        ax = 0x108;
+        break;  // renameat
+      case 491:
+        ax = 0x107;
+        break;  // unlinkat
+      case 326:
+        ax = 0x4F;
+        break;  // getcwd (__getcwd)
+      case 569:
+        ax = 0x146;
+        break;  // copy_file_range
+      case 515:
+        ax = 0x23c;
+        break;  // cap_rights_get
+      case 516:
+      case 533:
+      case 534:
+      case 536:
+        ax = 0x18;
+        break;  // cap_enter, cap_rights_limit, cap_ioctls_limit,
+                // cap_fcntls_limit
+      case 517:
+        ax = 0x23b;
+        break;  // cap_getmode
+      case 518:
+        ax = 0x206;
+        break;  // pdfork
+      case 6:
+        ax = 0x03;
+        break;  // close
+      case 7:
+        ax = 0x3d;
+        break;  // wait4
+      case 9:
+        ax = 0x56;
+        break;  // link
+      case 135:
+        ax = 0x35;
+        break;  // socketpair
+      case 128:
+        ax = 0x52;
+        break;  // rename
+      case 10:
+        ax = 0x57;
+        break;  // unlink
+      case 12:
+        ax = 0x50;
+        break;  // chdir
+      case 13:
+        ax = 0x51;
+        break;  // fchdir
+      case 20:
+        ax = 0x27;
+        break;  // getpid
+      case 360:
+        ax = 0x76;
+        break;  // getresuid
+      case 361:
+        ax = 0x77;
+        break;  // getresgid
+      case 482:
+        ax = 0x70;
+        break;  // shm_open
+      case 483:
+        ax = 0x71;
+        break;  // shm_unlink
+      case 24:
+        ax = 0x66;
+        break;  // getuid
+      case 25:
+        ax = 0x6b;
+        break;  // geteuid
+      case 33:
+        ax = 0x15;
+        break;  // access
+      case 47:
+        ax = 0x68;
+        break;  // getgid
+      case 49:
+        ax = 0x6c;
+        break;  // getegid
+      case 136:
+        ax = 0x53;
+        break;  // mkdir
+      case 137:
+        ax = 0x54;
+        break;  // rmdir
+      case 54:
+        ax = 0x10;
+        break;  // ioctl
+      case 58:
+        ax = 0x59;
+        break;  // readlink
+      case 92:
+        ax = 0x48;
+        break;  // fcntl
+      case 164:
+        ax = 0x1FE;
+        break;  // uname
+      case 162:
+        ax = 0xAC;
+        break;  // getdomainname
+      case 163:
+        ax = 0xAB;
+        break;  // setdomainname
+      case 165:
+        ax = 0xFE;
+        break;  // sysarch
+      case 188:
+      case 555:
+        ax = 0x1F8;
+        break;  // stat
+      case 189:
+      case 551:
+        ax = 0x1F7;
+        break;  // fstat
+      case 190:
+      case 553:
+        ax = 0x1F9;
+        break;  // lstat
+      case 74:
+        ax = 0x0a;
+        break;  // mprotect
+      case 487:
+        ax = 0x0CC;
+        break;  // cpuset_getaffinity
+      case 194:
+        ax = 0x61;
+        break;  // getrlimit
+      case 202:
+        ax = 0x1FA;
+        break;  // sysctl
+      case 221:
+      case 554:
+        ax = 0x1F6;
+        break;  // getdirentries
+      case 232:
+        ax = 0xE4;
+        break;  // clock_gettime
+      case 233:
+        ax = 0xE3;
+        break;  // clock_settime
+      case 234:
+        ax = 0xE5;
+        break;  // clock_getres
+      case 240:
+        ax = 0x23;
+        break;  // nanosleep
+      case 244:
+        ax = 0xE6;
+        break;  // clock_nanosleep
+      case 253:
+        ax = 0x0FD;
+        break;  // issetugid
+      case 272:
+        ax = 0x1FD;
+        break;  // getdents
+      case 340:
+        ax = 0x0ED;
+        break;  // sigprocmask
+      case 342:
+        ax = 0x1FB;
+        break;  // __sys_sigaction
+      case 432:
+        ax = 0x1B0;
+        break;  // thr_self
+      case 433:
+        ax = 0x1B1;
+        break;  // thr_kill
+      case 570:
+        ax = 0x23a;
+        break;  // shm_open2
+      case 416:
+        ax = 0x1FB;
+        break;  // sigaction
+      case 417:
+        ax = 0x0F;
+        break;  // sigreturn
+      case 477:
+        ax = 0x09;
+        break;  // mmap
+      case 73:
+        ax = 0x0b;
+        break;  // munmap
+      case 493:
+      case 552:
+      case 556:
+        ax = 0x1FC;
+        break;  // fstatat
+      // Socket-related syscalls
+      case 97:
+        ax = 0x29;
+        break;  // socket
+      case 98:
+        ax = 0x2A;
+        break;  // connect
+      case 30:
+        ax = 0x2B;
+        break;  // accept
+      case 104:
+        ax = 0x31;
+        break;  // bind
+      case 105:
+        ax = 0x36;
+        break;  // setsockopt
+      case 106:
+        ax = 0x32;
+        break;  // listen
+      case 118:
+        ax = 0x37;
+        break;  // getsockopt
+      case 31:
+        ax = 0x34;
+        break;  // getpeername
+      case 32:
+        ax = 0x33;
+        break;  // getsockname
+      case 27:
+        ax = 0x2F;
+        break;  // recvmsg
+      case 28:
+        ax = 0x2E;
+        break;  // sendmsg
+      case 29:
+        ax = 0x2D;
+        break;  // recvfrom
+      case 133:
+        ax = 0x2C;
+        break;  // sendto
+      case 134:
+        ax = 0x30;
+        break;  // shutdown
+      default:
+        break;
+    }
+  }
   di = Get64(m->di);
   si = Get64(m->si);
   dx = Get64(m->dx);
@@ -5578,6 +6454,8 @@ void OpSyscall(P) {
     SYSCALL(2, 0x09E, "arch_prctl", SysArchPrctl, STRACE_2);
     SYSCALL(2, 0x0A0, "setrlimit", SysSetrlimit, STRACE_SETRLIMIT);
     SYSCALL(0, 0x0A2, "sync", SysSync, STRACE_SYNC);
+    SYSCALL(2, 0x0AB, "setdomainname", SysSetdomainname, STRACE_2);
+    SYSCALL(2, 0x0AC, "getdomainname", SysGetdomainname, STRACE_2);
     SYSCALL(3, 0x0D9, "getdents", SysGetdents, STRACE_3);
     SYSCALL(1, 0x0DA, "set_tid_address", SysSetTidAddress, STRACE_1);
     SYSCALL(4, 0x0DD, "fadvise", SysFadvise, STRACE_4);
@@ -5682,9 +6560,27 @@ void OpSyscall(P) {
     SYSCALL(5, 0x10F, "ppoll", SysPpoll, STRACE_5);
     SYSCALL(5, 0x13C, "renameat2", SysRenameat2, STRACE_RENAMEAT2);
     SYSCALL(3, 0x13E, "getrandom", SysGetrandom, STRACE_GETRANDOM);
+    SYSCALL(6, 0x146, "copy_file_range", SysCopyFileRange, STRACE_6);
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
+    SYSCALL(2, 0x0FE, "sysarch", SysSysarch, STRACE_2);
+    SYSCALL(0, 0x0FD, "issetugid", SysFreeBSDIssetugid, STRACE_0);
+    SYSCALL(3, 0x0ED, "sigprocmask", SysFreeBSDSigprocmask, STRACE_3);
+    SYSCALL(4, 0x1F6, "getdirentries", SysFreeBSDGetdirentries, STRACE_4);
+    SYSCALL(3, 0x1FD, "getdents", SysFreeBSDGetdents, STRACE_3);
+    SYSCALL(1, 0x1FE, "uname", SysFreeBSDUname, STRACE_1);
+    SYSCALL(3, 0x1FB, "sigaction", SysFreeBSDSigaction, STRACE_3);
+    SYSCALL(4, 0x1FC, "fstatat", SysFreeBSDFstatat, STRACE_4);
+    SYSCALL(6, 0x1FA, "sysctl", SysFreeBSDSysctl, STRACE_6);
+    SYSCALL(2, 0x1F8, "stat", SysFreeBSDStat, STRACE_2);
+    SYSCALL(2, 0x1F7, "fstat", SysFreeBSDFstat, STRACE_2);
+    SYSCALL(2, 0x1F9, "lstat", SysFreeBSDLstat, STRACE_2);
+    SYSCALL(1, 0x1B0, "thr_self", SysFreeBSDThrSelf, STRACE_1);
+    SYSCALL(2, 0x1B1, "thr_kill", SysFreeBSDThrKill, STRACE_2);
+    SYSCALL(5, 0x23a, "shm_open2", SysFreeBSDShmOpen2, STRACE_5);
+    SYSCALL(1, 0x23d, "shm_unlink", SysFreeBSDShmUnlink, STRACE_1);
+    SYSCALL(2, 392, "uuidgen", SysFreeBSDUuidgen, STRACE_2);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
@@ -5704,7 +6600,7 @@ void OpSyscall(P) {
       SigRestore(m);
       m->interrupted = true;  // preevnt ax clobber
       break;
-    case 0x146:
+    //case 0x146:
       // avoid noisy copy_file_range() feature check in cosmo
     case 0x1BC:
       // avoid noisy landlock_create_ruleset() feature check in cosmo
@@ -5717,6 +6613,15 @@ void OpSyscall(P) {
       // time() is also noisy in some environments.
       ax = SysTime(m, di);
       break;
+    case 0x0FC:
+      ax = SysFreeBSDFstat(m, di, si);
+      break;
+    case 0x0FA:
+      ax = -38;  // ENOSYS (sysctl stub)
+      break;
+    case 0x206:
+      ax = SysFreeBSDpdfork(m, di, si);
+      break;
     default:
     DefaultCase:
       LOGF("missing syscall 0x%03" PRIx64, ax);
@@ -5724,7 +6629,20 @@ void OpSyscall(P) {
       break;
   }
   if (!m->interrupted) {
-    Put64(m->ax, ax != -1 ? ax : -(XlatErrno(errno) & 0xfff));
+    if (m->system->isfreebsd) {
+      if (ax != (u64)-1) {
+        Put64(m->ax, ax);
+        m->flags &= ~(1u << FLAGS_CF);
+      } else {
+        Put64(m->ax, XlatErrnoToFreeBSD(errno));
+        m->flags |= 1u << FLAGS_CF;
+      }
+    } else {
+      if (ax == (u64)-1) {
+        ax = -(XlatErrno(errno) & 0xfff);
+      }
+      Put64(m->ax, ax);
+    }
   }
   unassert(--m->sysdepth >= 0);
   CollectPageLocks(m);

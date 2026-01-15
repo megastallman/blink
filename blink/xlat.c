@@ -206,6 +206,97 @@ int XlatErrno(int x) {
   return x;
 }
 
+int XlatErrnoToFreeBSD(int x) {
+  if (x == EPERM) return 1;
+  if (x == ENOENT) return 2;
+  if (x == ESRCH) return 3;
+  if (x == EINTR) return 4;
+  if (x == EIO) return 5;
+  if (x == ENXIO) return 6;
+  if (x == E2BIG) return 7;
+  if (x == ENOEXEC) return 8;
+  if (x == EBADF) return 9;
+  if (x == ECHILD) return 10;
+  if (x == EDEADLK) return 11;
+  if (x == ENOMEM) return 12;
+  if (x == EACCES) return 13;
+  if (x == EFAULT) return 14;
+#ifdef ENOTBLK
+  if (x == ENOTBLK) return 15;
+#endif
+  if (x == EBUSY) return 16;
+  if (x == EEXIST) return 17;
+  if (x == EXDEV) return 18;
+  if (x == ENODEV) return 19;
+  if (x == ENOTDIR) return 20;
+  if (x == EISDIR) return 21;
+  if (x == EINVAL) return 22;
+  if (x == ENFILE) return 23;
+  if (x == EMFILE) return 24;
+  if (x == ENOTTY) return 25;
+  if (x == ETXTBSY) return 26;
+  if (x == EFBIG) return 27;
+  if (x == ENOSPC) return 28;
+  if (x == ESPIPE) return 29;
+  if (x == EROFS) return 30;
+  if (x == EMLINK) return 31;
+  if (x == EPIPE) return 32;
+  if (x == EDOM) return 33;
+  if (x == ERANGE) return 34;
+  if (x == EAGAIN) return 35;
+#if EWOULDBLOCK != EAGAIN
+  if (x == EWOULDBLOCK) return 35;
+#endif
+  if (x == EINPROGRESS) return 36;
+  if (x == EALREADY) return 37;
+  if (x == ENOTSOCK) return 38;
+  if (x == EDESTADDRREQ) return 39;
+  if (x == EMSGSIZE) return 40;
+  if (x == EPROTOTYPE) return 41;
+  if (x == ENOPROTOOPT) return 42;
+  if (x == EPROTONOSUPPORT) return 43;
+#ifdef ESOCKTNOSUPPORT
+  if (x == ESOCKTNOSUPPORT) return 44;
+#endif
+  if (x == ENOTSUP) return 45;
+#if EOPNOTSUPP != ENOTSUP
+  if (x == EOPNOTSUPP) return 45;
+#endif
+#ifdef EPFNOSUPPORT
+  if (x == EPFNOSUPPORT) return 46;
+#endif
+  if (x == EAFNOSUPPORT) return 47;
+  if (x == EADDRINUSE) return 48;
+  if (x == EADDRNOTAVAIL) return 49;
+  if (x == ENETDOWN) return 50;
+  if (x == ENETUNREACH) return 51;
+  if (x == ENETRESET) return 52;
+  if (x == ECONNABORTED) return 53;
+  if (x == ECONNRESET) return 54;
+  if (x == ENOBUFS) return 55;
+  if (x == EISCONN) return 56;
+  if (x == ENOTCONN) return 57;
+#ifdef ESHUTDOWN
+  if (x == ESHUTDOWN) return 58;
+#endif
+#ifdef ETOOMANYREFS
+  if (x == ETOOMANYREFS) return 59;
+#endif
+  if (x == ETIMEDOUT) return 60;
+  if (x == ECONNREFUSED) return 61;
+  if (x == ELOOP) return 62;
+  if (x == ENAMETOOLONG) return 63;
+#ifdef EHOSTDOWN
+  if (x == EHOSTDOWN) return 64;
+#endif
+  if (x == EHOSTUNREACH) return 65;
+  if (x == ENOTEMPTY) return 66;
+  if (x == ESTALE) return 70;
+  if (x == EDQUOT) return 69;
+  if (x == ENOSYS) return 78;
+  return XlatErrno(x);
+}
+
 int XlatSignal(int x) {
   switch (x) {
     XLAT(SIGHUP_LINUX, SIGHUP);
@@ -778,8 +869,8 @@ int XlatClock(int x, clock_t *clock) {
 #ifdef CLOCK_BOOTTIME
     CASE(CLOCK_BOOTTIME_LINUX, res = CLOCK_BOOTTIME);
 #endif
-#ifdef CLOCK_TAI
-    CASE(CLOCK_TAI_LINUX, res = CLOCK_TAI);
+#ifdef CLOCK_MONOTONIC
+    CASE(12, res = CLOCK_MONOTONIC);
 #endif
 #endif /* DISABLE_NONPOSIX */
     default:
@@ -882,6 +973,16 @@ int XlatOpenFlags(int x) {
 #ifdef O_NOATIME
   if (x & O_NOATIME_LINUX) res |= O_NOATIME, x &= ~O_NOATIME_LINUX;
 #endif
+#endif
+#ifdef O_RESOLVE
+  if (x & O_RESOLVE_LINUX) res |= O_RESOLVE, x &= ~O_RESOLVE_LINUX;
+#else
+  x &= ~O_RESOLVE_LINUX;
+#endif
+#ifdef O_RESOLVE
+  if (x & O_RESOLVE_LINUX) res |= O_RESOLVE, x &= ~O_RESOLVE_LINUX;
+#else
+  x &= ~O_RESOLVE_LINUX;
 #endif
   if (x) {
     LOGF("%s %#x not supported", "open flags", x);
