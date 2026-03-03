@@ -49,6 +49,6 @@
 #define kMaxSigDepth  8
 
 #define kStraceArgMax 256
-#define kStraceBufMax 32
+#define kStraceBufMax 128
 
 #endif /* BLINK_TUNABLES_H_ */

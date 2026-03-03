@@ -500,12 +500,16 @@ static int SysFreeBSDpdfork(struct Machine* m, i64 fdpaddr, i32 flags) {
       return -1;
     }
   } else if (!rc) {
+    // Child: keep sv[1] open as a sentinel at a high fd that the emulated
+    // program will never accidentally close (it's not in Blink's fd table).
+    // When this child process exits, the sentinel closes and the parent's
+    // sv[0] (the process descriptor) sees EOF — signaling child death.
+    // Close sv[0] in the child; the child doesn't use the parent's pd end.
+    int sentinel = fcntl(sv[1], F_DUPFD, 1000);
     close(sv[0]);
-    if (dup2(sv[1], 3) == -1) _exit(127);
     close(sv[1]);
-    LOCK(&m->system->fds.lock);
-    AddFd(&m->system->fds, 3, 0);
-    UNLOCK(&m->system->fds.lock);
+    if (sentinel == -1) _exit(127);
+    (void)sentinel;
   } else {
     close(sv[0]);
     close(sv[1]);
@@ -1771,6 +1775,22 @@ static int XlatSendFlags(int flags, int socktype) {
   return hostflags;
 }
 
+// FreeBSD MSG flags differ from Linux MSG flags for many values.
+// FreeBSD: OOB=0x1 PEEK=0x2 TRUNC=0x10 WAITALL=0x40 DONTWAIT=0x80
+//          CMSG_CLOEXEC=0x40000
+// Linux:   OOB=0x1 PEEK=0x2 TRUNC=0x20 WAITALL=0x100 DONTWAIT=0x40
+//          CMSG_CLOEXEC=0x40000000
+static int XlatFreeBSDRecvFlags(int flags) {
+  int out = 0;
+  if (flags & 0x001) out |= MSG_OOB_LINUX;
+  if (flags & 0x002) out |= MSG_PEEK_LINUX;
+  if (flags & 0x010) out |= MSG_TRUNC_LINUX;
+  if (flags & 0x040) out |= MSG_WAITALL_LINUX;
+  if (flags & 0x080) out |= MSG_DONTWAIT_LINUX;
+  if (flags & 0x40000) out |= MSG_CMSG_CLOEXEC_LINUX;
+  return out;
+}
+
 static int XlatRecvFlags(int flags) {
   int supported, hostflags;
   supported = MSG_OOB_LINUX |    //
@@ -1976,6 +1996,7 @@ static i64 SysRecvfrom(struct Machine *m,  //
   struct msghdr msg;
   bool norestart = false;
   struct sockaddr_storage addr;
+  if (m->system->isfreebsd) flags = XlatFreeBSDRecvFlags(flags);
   if ((hostflags = XlatRecvFlags(flags)) == -1) return -1;
   if (GetNoRestart(m, fildes, &norestart) == -1) return -1;
   if (CheckSockaddr(m, sockaddr_addr, sockaddr_size_addr) == -1) return -1;
@@ -2068,6 +2089,7 @@ static i64 SysRecvmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
   bool norestart = false;
   struct msghdr_linux gm;
   struct sockaddr_storage addr;
+  if (m->system->isfreebsd) flags = XlatFreeBSDRecvFlags(flags);
   if ((flags = XlatRecvFlags(flags)) == -1) return -1;
   if (GetNoRestart(m, fildes, &norestart) == -1) return -1;
   if (CopyFromUserRead(m, &gm, msgaddr, sizeof(gm)) == -1) return -1;
@@ -2103,6 +2125,22 @@ static i64 SysRecvmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
 #ifndef DISABLE_ANCILLARY
       if (ReceiveAncillary(m, &gm, &msg, flags) == -1) {
         return -1;
+      }
+      // Write back updated msg_controllen to guest msghdr.
+      // FreeBSD msg_controllen is socklen_t (32-bit) while Linux is size_t (64-bit),
+      // but both are at the same struct offset. ReceiveAncillary sets gm.controllen
+      // to the actual bytes written; without this write-back, the guest sees the
+      // original buffer size, causing FreeBSD fd_recv to misparse cmsg boundaries.
+      if (m->system->isfreebsd) {
+        u8 buf[4];
+        Write32(buf, (u32)Read64(gm.controllen));
+        unassert(CopyToUserWrite(
+                     m, msgaddr + offsetof(struct msghdr_linux, controllen),
+                     buf, 4) != -1);
+      } else {
+        unassert(CopyToUserWrite(
+                     m, msgaddr + offsetof(struct msghdr_linux, controllen),
+                     gm.controllen, 8) != -1);
       }
 #endif
       if (Read64(gm.name)) {
@@ -2317,6 +2355,10 @@ static int SysSetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   void *optval;
   struct Fd *fd;
   int syslevel, sysoptname;
+  if (m->system->isfreebsd) {
+    level = XlatFreeBSDSocketLevel(level);
+    if (level == SOL_SOCKET_LINUX) optname = XlatFreeBSDSocketOptname(optname);
+  }
   switch (level) {
     case SOL_SOCKET_LINUX:
       switch (optname) {
@@ -2354,6 +2396,10 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   socklen_t optvalsize;
   u8 optvalsize_linux[4];
   int syslevel, sysoptname;
+  if (m->system->isfreebsd) {
+    level = XlatFreeBSDSocketLevel(level);
+    if (level == SOL_SOCKET_LINUX) optname = XlatFreeBSDSocketOptname(optname);
+  }
   switch (level) {
     case SOL_SOCKET_LINUX:
       switch (optname) {
@@ -6217,6 +6263,12 @@ void OpSyscall(P) {
       case 92:
         ax = 0x48;
         break;  // fcntl
+      case 93:
+        ax = 0x17;
+        break;  // select
+      case 123:
+        ax = 0x5d;
+        break;  // fchown
       case 164:
         ax = 0x1FE;
         break;  // uname

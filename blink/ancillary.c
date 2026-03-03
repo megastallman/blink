@@ -116,10 +116,30 @@ static int SendScmRights(struct Machine *m, struct msghdr *msg,
 }
 #endif
 
+// FreeBSD cmsghdr: [len:4][level:4][type:4][pad:4][data...]  (12-byte header)
+// Linux  cmsghdr: [len:8][level:4][type:4][data...]          (16-byte header)
+// Both put data at offset 16 (CMSG_ALIGN applies the same padding on 64-bit).
+// Detect FreeBSD by checking if bytes 4-7 of the len[] field are non-zero
+// (on Linux those high bytes of cmsg_len are always zero for any real message).
+static void ReadCmsgLevelType(const struct cmsghdr_linux *gcmsg, u32 *level,
+                              u32 *type) {
+  u32 hi = Read32(gcmsg->len + 4);
+  if (hi) {
+    // FreeBSD layout: level at bytes 4-7, type at bytes 8-11
+    *level = (hi == 0xffff) ? SOL_SOCKET_LINUX : hi;
+    *type = Read32(gcmsg->level);
+  } else {
+    *level = Read32(gcmsg->level);
+    *type = Read32(gcmsg->type);
+  }
+}
+
 static ssize_t GetAncillaryElementLength(const struct cmsghdr_linux *gcmsg) {
-  switch (Read32(gcmsg->level)) {
+  u32 level, type;
+  ReadCmsgLevelType(gcmsg, &level, &type);
+  switch (level) {
     case SOL_SOCKET_LINUX:
-      switch (Read32(gcmsg->type)) {
+      switch (type) {
 #ifdef SCM_RIGHTS
         case SCM_RIGHTS_LINUX:
           return 4;
@@ -136,8 +156,7 @@ static ssize_t GetAncillaryElementLength(const struct cmsghdr_linux *gcmsg) {
     default:
       break;
   }
-  LOGF("%s ancillary level=%d type=%d", "unsupported", Read32(gcmsg->level),
-       Read32(gcmsg->type));
+  LOGF("%s ancillary level=%d type=%d", "unsupported", level, type);
   return einval();
 }
 
@@ -193,9 +212,11 @@ int SendAncillary(struct Machine *m, struct msghdr *msg,
       payload = 0;
       elements = 0;
     }
-    switch (Read32(gcmsg->level)) {
+    u32 clevel, ctype;
+    ReadCmsgLevelType(gcmsg, &clevel, &ctype);
+    switch (clevel) {
       case SOL_SOCKET_LINUX:
-        switch (Read32(gcmsg->type)) {
+        switch (ctype) {
 #ifdef SCM_RIGHTS
           case SCM_RIGHTS_LINUX:
             if (SendScmRights(m, msg, (const u8 *)payload, elements) == -1)
@@ -230,11 +251,23 @@ static i64 CopyCmsg(struct Machine *m, struct msghdr_linux *gm, int level,
   size_t hdrspace;
   struct cmsghdr_linux gcmsg;
   hdrspace = ROUNDUP(sizeof(gcmsg), 8);
-  Write64(gcmsg.len, hdrspace + len);
-  Write32(gcmsg.level, level);
-  Write32(gcmsg.type, type);
   control = Read64(gm->control);
-  unassert(CopyToUserWrite(m, control + i, &gcmsg, sizeof(gcmsg)) != -1);
+  if (m->system->isfreebsd) {
+    // FreeBSD 64-bit cmsghdr: [len:4][level:4][type:4][pad:4][data...]
+    // CMSG_DATA still starts at offset 16 (CMSG_ALIGN(12) = 16 on 64-bit FreeBSD)
+    // but cmsg_len is 32-bit and SOL_SOCKET is 0xffff (not 1 as in Linux).
+    u8 fbcmsg[16] = {0};
+    int freebsd_level = (level == SOL_SOCKET_LINUX) ? 0xffff : level;
+    Write32(fbcmsg + 0, (u32)(hdrspace + len));
+    Write32(fbcmsg + 4, freebsd_level);
+    Write32(fbcmsg + 8, type);
+    unassert(CopyToUserWrite(m, control + i, fbcmsg, 16) != -1);
+  } else {
+    Write64(gcmsg.len, hdrspace + len);
+    Write32(gcmsg.level, level);
+    Write32(gcmsg.type, type);
+    unassert(CopyToUserWrite(m, control + i, &gcmsg, sizeof(gcmsg)) != -1);
+  }
   unassert(CopyToUserWrite(m, control + i + hdrspace, data, len) != -1);
   return hdrspace + ROUNDUP(len, 8);
 }

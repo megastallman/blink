@@ -27,6 +27,8 @@ int XlatResource(int);
 int XlatRusage(int);
 int XlatShutdown(int);
 int XlatSignal(int);
+int XlatFreeBSDSocketLevel(int);
+int XlatFreeBSDSocketOptname(int);
 int XlatSocketFamily(int);
 int XlatSocketLevel(int, int *);
 int XlatSocketOptname(int, int);

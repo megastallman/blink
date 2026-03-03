@@ -683,6 +683,35 @@ int XlatSocketLevel(int x, int *level) {
   return 0;
 }
 
+// FreeBSD uses 0xffff for SOL_SOCKET; other protocol levels are the same
+int XlatFreeBSDSocketLevel(int x) {
+  if ((unsigned)x == 0xffffu) return SOL_SOCKET_LINUX;
+  return x;
+}
+
+// Translate FreeBSD SO_* optname values for SOL_SOCKET to Linux equivalents.
+// FreeBSD encodes SO_* as 0x1001..0x1008 and 0x0001..0x0200 ranges.
+int XlatFreeBSDSocketOptname(int optname) {
+  switch ((unsigned)optname) {
+    case 0x0001u: return SO_DEBUG_LINUX;      // SO_DEBUG
+    case 0x0004u: return SO_REUSEADDR_LINUX;  // SO_REUSEADDR
+    case 0x0008u: return SO_KEEPALIVE_LINUX;  // SO_KEEPALIVE
+    case 0x0010u: return SO_DONTROUTE_LINUX;  // SO_DONTROUTE
+    case 0x0020u: return SO_BROADCAST_LINUX;  // SO_BROADCAST
+    case 0x0080u: return SO_LINGER_LINUX;     // SO_LINGER
+    case 0x0200u: return SO_REUSEPORT_LINUX;  // SO_REUSEPORT
+    case 0x1001u: return SO_SNDBUF_LINUX;     // SO_SNDBUF
+    case 0x1002u: return SO_RCVBUF_LINUX;     // SO_RCVBUF
+    case 0x1003u: return SO_SNDLOWAT_LINUX;   // SO_SNDLOWAT
+    case 0x1004u: return SO_RCVLOWAT_LINUX;   // SO_RCVLOWAT
+    case 0x1005u: return SO_SNDTIMEO_LINUX;   // SO_SNDTIMEO
+    case 0x1006u: return SO_RCVTIMEO_LINUX;   // SO_RCVTIMEO
+    case 0x1007u: return SO_ERROR_LINUX;      // SO_ERROR
+    case 0x1008u: return SO_TYPE_LINUX;       // SO_TYPE
+    default:      return optname;
+  }
+}
+
 int XlatSocketOptname(int level, int optname) {
   switch (level) {
     case SOL_SOCKET_LINUX:
