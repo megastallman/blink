@@ -297,6 +297,27 @@ int XlatErrnoToFreeBSD(int x) {
   return XlatErrno(x);
 }
 
+// Translate FreeBSD signal number to Linux signal number.
+// FreeBSD and Linux agree on signals 1-6, 8-9, 11, 13-15, 21-22, 24-28.
+// The job-control signals and a few others differ.
+int XlatFreeBSDSignal(int x) {
+  switch (x) {
+    case 7:  return SIGEMT_LINUX;   // FreeBSD SIGEMT
+    case 10: return SIGBUS_LINUX;   // FreeBSD SIGBUS
+    case 12: return SIGSYS_LINUX;   // FreeBSD SIGSYS
+    case 16: return SIGURG_LINUX;   // FreeBSD SIGURG
+    case 17: return SIGSTOP_LINUX;  // FreeBSD SIGSTOP
+    case 18: return SIGTSTP_LINUX;  // FreeBSD SIGTSTP
+    case 19: return SIGCONT_LINUX;  // FreeBSD SIGCONT
+    case 20: return SIGCHLD_LINUX;  // FreeBSD SIGCHLD
+    case 23: return SIGIO_LINUX;    // FreeBSD SIGIO
+    case 29: return SIGINFO_LINUX;  // FreeBSD SIGINFO
+    case 30: return SIGUSR1_LINUX;  // FreeBSD SIGUSR1
+    case 31: return SIGUSR2_LINUX;  // FreeBSD SIGUSR2
+    default: return x;
+  }
+}
+
 int XlatSignal(int x) {
   switch (x) {
     XLAT(SIGHUP_LINUX, SIGHUP);
@@ -1139,13 +1160,27 @@ int UnXlatItimer(int x) {
   }
 }
 
+// FreeBSD AF_INET6=28; Linux AF_INET6=10. AF_UNSPEC/UNIX/INET are the same.
+#define AF_INET6_FREEBSD 28
+
 int XlatSockaddrToHost(struct sockaddr_storage *dst,
-                       const struct sockaddr_linux *src, u32 srclen) {
+                       const struct sockaddr_linux *src, u32 srclen,
+                       bool isfreebsd) {
+  int family;
   if (srclen < 2) {
     LOGF("sockaddr size %d too small for %s", (int)srclen, "family");
     return einval();
   }
-  switch (Read16(src->family)) {
+  if (isfreebsd) {
+    // FreeBSD sockaddr: byte[0]=sa_len, byte[1]=sa_family.
+    // Linux sockaddr: bytes[0-1]=sa_family (16-bit LE).
+    // Data from byte[2] onwards has the same layout for inet/inet6.
+    family = src->family[1];
+    if (family == AF_INET6_FREEBSD) family = AF_INET6_LINUX;
+  } else {
+    family = Read16(src->family);
+  }
+  switch (family) {
     case AF_UNSPEC_LINUX:
       memset(dst, 0, sizeof(*dst));
       dst->ss_family = AF_UNSPEC;
@@ -1213,7 +1248,9 @@ int XlatSockaddrToHost(struct sockaddr_storage *dst,
 }
 
 int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
-                        const struct sockaddr *src, socklen_t srclen) {
+                        const struct sockaddr *src, socklen_t srclen,
+                        bool isfreebsd) {
+  int ret;
   if (srclen < 2) {
     LOGF("sockaddr size %d too small for %s", (int)srclen, "family");
     return einval();
@@ -1236,10 +1273,16 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
       return einval();
     }
     memset(dst_un, 0, sizeof(*dst_un));
-    Write16(dst_un->family, AF_UNIX_LINUX);
+    ret = offsetof(struct sockaddr_un, sun_path) + n + 1;
+    if (isfreebsd) {
+      dst_un->family[0] = (u8)ret;  // sa_len
+      dst_un->family[1] = AF_UNIX_LINUX;
+    } else {
+      Write16(dst_un->family, AF_UNIX_LINUX);
+    }
     if (n) memcpy(dst_un->path, src_un->sun_path, n);
     dst_un->path[n] = 0;
-    return offsetof(struct sockaddr_un, sun_path) + n + 1;
+    return ret;
   } else if (src->sa_family == AF_INET) {
     struct sockaddr_in_linux *dst_in;
     const struct sockaddr_in *src_in;
@@ -1250,7 +1293,12 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
     dst_in = (struct sockaddr_in_linux *)dst;
     src_in = (const struct sockaddr_in *)src;
     memset(dst_in, 0, sizeof(*dst_in));
-    Write16(dst_in->family, AF_INET_LINUX);
+    if (isfreebsd) {
+      dst_in->family[0] = sizeof(struct sockaddr_in_linux);  // sa_len=16
+      dst_in->family[1] = AF_INET_LINUX;                     // sa_family=2
+    } else {
+      Write16(dst_in->family, AF_INET_LINUX);
+    }
     dst_in->port = src_in->sin_port;
     dst_in->addr = src_in->sin_addr.s_addr;
     return sizeof(struct sockaddr_in_linux);
@@ -1264,7 +1312,12 @@ int XlatSockaddrToLinux(struct sockaddr_storage_linux *dst,
     dst_in = (struct sockaddr_in6_linux *)dst;
     src_in = (const struct sockaddr_in6 *)src;
     memset(dst_in, 0, sizeof(*dst_in));
-    Write16(dst_in->family, AF_INET6_LINUX);
+    if (isfreebsd) {
+      dst_in->family[0] = sizeof(struct sockaddr_in6_linux);  // sa_len=28
+      dst_in->family[1] = AF_INET6_FREEBSD;                   // sa_family=28
+    } else {
+      Write16(dst_in->family, AF_INET6_LINUX);
+    }
     dst_in->port = src_in->sin6_port;
     memcpy(dst_in->addr, &src_in->sin6_addr, 16);
     return sizeof(struct sockaddr_in6_linux);

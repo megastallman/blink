@@ -1524,6 +1524,7 @@ static int SysUname(struct Machine *m, i64 utsaddr) {
 
 #define SOCK_CLOEXEC_FREEBSD  0x10000000
 #define SOCK_NONBLOCK_FREEBSD 0x20000000
+#define AF_INET6_FREEBSD      28
 
 static int SysSocket(struct Machine* m, i32 family, i32 type, i32 protocol) {
   struct Fd* fd;
@@ -1533,6 +1534,8 @@ static int SysSocket(struct Machine* m, i32 family, i32 type, i32 protocol) {
     if (type & SOCK_CLOEXEC_FREEBSD) flags |= SOCK_CLOEXEC_LINUX;
     if (type & SOCK_NONBLOCK_FREEBSD) flags |= SOCK_NONBLOCK_LINUX;
     type &= ~(SOCK_CLOEXEC_FREEBSD | SOCK_NONBLOCK_FREEBSD);
+    // FreeBSD AF_INET6=28 differs from Linux AF_INET6=10
+    if (family == AF_INET6_FREEBSD) family = AF_INET6_LINUX;
   } else {
     flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
     type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
@@ -1570,6 +1573,7 @@ static int SysSocketpair(struct Machine *m, i32 family, i32 type, i32 protocol,
     if (type & SOCK_CLOEXEC_FREEBSD) flags |= SOCK_CLOEXEC_LINUX;
     if (type & SOCK_NONBLOCK_FREEBSD) flags |= SOCK_NONBLOCK_LINUX;
     type &= ~(SOCK_CLOEXEC_FREEBSD | SOCK_NONBLOCK_FREEBSD);
+    if (family == AF_INET6_FREEBSD) family = AF_INET6_LINUX;
   } else {
     flags = type & (SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
     type &= ~(SOCK_NONBLOCK_LINUX | SOCK_CLOEXEC_LINUX);
@@ -1627,7 +1631,8 @@ static int LoadSockaddr(struct Machine *m, i64 sockaddr_addr, u32 sockaddr_size,
   const struct sockaddr_linux *sockaddr_linux;
   if ((sockaddr_linux = (const struct sockaddr_linux *)SchlepR(
            m, sockaddr_addr, sockaddr_size))) {
-    return XlatSockaddrToHost(out_sockaddr, sockaddr_linux, sockaddr_size);
+    return XlatSockaddrToHost(out_sockaddr, sockaddr_linux, sockaddr_size,
+                              m->system->isfreebsd);
   } else {
     return -1;
   }
@@ -1651,7 +1656,8 @@ static int StoreSockaddr(struct Machine *m, i64 sockaddr_addr,
   if (!sockaddr_addr) return 0;
   if (!sockaddr_size_addr) return 0;
   avail = LoadAddrSize(m, sockaddr_size_addr);
-  if ((got = XlatSockaddrToLinux(&ss, sa, salen)) == -1) return -1;
+  if ((got = XlatSockaddrToLinux(&ss, sa, salen, m->system->isfreebsd)) == -1)
+    return -1;
   if (StoreAddrSize(m, sockaddr_size_addr, got) == -1) return -1;
   return CopyToUserWrite(m, sockaddr_addr, &ss, MIN(got, avail));
 }
@@ -2931,6 +2937,19 @@ static i64 SysFtruncate(struct Machine *m, i32 fildes, i64 length) {
   return rc;
 }
 
+// FreeBSD AT flags differ from Linux:
+//   AT_EACCESS=0x100 (FreeBSD) vs AT_SYMLINK_NOFOLLOW=0x100 (Linux)
+//   AT_SYMLINK_NOFOLLOW=0x200 (FreeBSD) vs AT_EACCESS=0x200 (Linux)
+//   AT_REMOVEDIR=0x800 (FreeBSD) vs AT_REMOVEDIR=0x200 (Linux)
+// Translate FreeBSD AT flags to Linux equivalents.
+static i32 XlatFreeBSDAtFlags(i32 x) {
+  i32 r = x & ~0xb00;  // mask out FreeBSD-specific bits (0x100|0x200|0x800)
+  if (x & 0x200) r |= AT_SYMLINK_NOFOLLOW_LINUX;  // FreeBSD nofollow → Linux
+  if (x & 0x100) r |= AT_EACCESS_LINUX;           // FreeBSD AT_EACCESS → Linux
+  if (x & 0x800) r |= AT_REMOVEDIR_LINUX;         // FreeBSD AT_REMOVEDIR → Linux
+  return r;
+}
+
 static int XlatFaccessatFlags(int x) {
   int res = 0;
   if (x & AT_EACCESS_LINUX) {
@@ -2955,6 +2974,7 @@ static int XlatFaccessatFlags(int x) {
 
 static int SysFaccessat2(struct Machine *m, i32 dirfd, i64 path, i32 mode,
                          i32 flags) {
+  if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   return VfsAccess(GetDirFildes(dirfd), LoadStr(m, path), XlatAccess(mode),
                    XlatFaccessatFlags(flags));
 }
@@ -3004,6 +3024,7 @@ static int SysFstatat(struct Machine *m, i32 dirfd, i64 pathaddr, i64 staddr,
   struct stat st;
   const char *path;
   struct stat_linux gst;
+  if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   if (!(path = LoadStr(m, pathaddr))) return -1;
 #ifndef DISABLE_NONPOSIX
   if (flags & AT_EMPTY_PATH_LINUX) {
@@ -3056,6 +3077,7 @@ static int SysFchown(struct Machine *m, i32 fildes, u32 uid, u32 gid) {
 static int SysFchownat(struct Machine *m, i32 dirfd, i64 pathaddr, u32 uid,
                        u32 gid, i32 flags) {
   const char *path;
+  if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   if (!(path = LoadStr(m, pathaddr))) return -1;
 #ifndef DISABLE_NONPOSIX
   if (flags & AT_EMPTY_PATH_LINUX) {
@@ -3396,9 +3418,34 @@ static int SysFcntlGetownEx(struct Machine *m, i32 fildes, i64 addr) {
 }
 #endif
 
+// FreeBSD fcntl command numbers that differ from Linux
+#define FBSD_F_GETOWN          5
+#define FBSD_F_SETOWN          6
+#define FBSD_F_GETLK          11
+#define FBSD_F_SETLK          12
+#define FBSD_F_SETLKW         13
+#define FBSD_F_DUPFD_CLOEXEC  17
+#define FBSD_F_DUP2FD         10
+#define FBSD_F_DUP2FD_CLOEXEC 18
+
 static int SysFcntl(struct Machine *m, i32 fildes, i32 cmd, i64 arg) {
   int rc, fl;
   struct Fd *fd;
+  if (m->system->isfreebsd) {
+    switch (cmd) {
+      case FBSD_F_GETOWN:         cmd = F_GETOWN_LINUX; break;
+      case FBSD_F_SETOWN:         cmd = F_SETOWN_LINUX; break;
+      case FBSD_F_GETLK:          cmd = F_GETLK_LINUX; break;
+      case FBSD_F_SETLK:          cmd = F_SETLK_LINUX; break;
+      case FBSD_F_SETLKW:         cmd = F_SETLKW_LINUX; break;
+      case FBSD_F_DUPFD_CLOEXEC:  cmd = F_DUPFD_CLOEXEC_LINUX; break;
+      case FBSD_F_DUP2FD:
+        return SysDup3(m, fildes, (i32)arg, 0);
+      case FBSD_F_DUP2FD_CLOEXEC:
+        return SysDup3(m, fildes, (i32)arg, O_CLOEXEC_LINUX);
+      default: break;
+    }
+  }
   if (cmd == F_DUPFD_LINUX) {
     return SysDupf(m, fildes, arg, F_DUPFD);
   } else if (cmd == F_DUPFD_CLOEXEC_LINUX) {
@@ -3570,6 +3617,7 @@ static int SysUnlinkat(struct Machine *m, i32 dirfd, i64 pathaddr, i32 flags) {
   int rc;
   const char *path;
   dirfd = GetDirFildes(dirfd);
+  if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   if ((flags = XlatUnlinkatFlags(flags)) == -1) return -1;
   if (!(path = LoadStr(m, pathaddr))) return -1;
   rc = VfsUnlink(dirfd, path, flags);
@@ -3732,6 +3780,17 @@ static int SysWait4(struct Machine *m, int pid, i64 opt_out_wstatus_addr,
   u8 gwstatusb[4];
   struct rusage hrusage;
   struct rusage_linux grusage;
+  if (m->system->isfreebsd) {
+    // FreeBSD wait4 flags differ from Linux:
+    // FreeBSD WCONTINUED=4, Linux WCONTINUED=8
+    // FreeBSD WNOWAIT=8, Linux WNOWAIT=0x01000000
+    int fbsd = options;
+    options = 0;
+    if (fbsd & 1) options |= WNOHANG_LINUX;
+    if (fbsd & 2) options |= WUNTRACED_LINUX;
+    if (fbsd & 4) options |= WCONTINUED_LINUX;  // FreeBSD WCONTINUED=4 → Linux 8
+    if (fbsd & 8) options |= WNOWAIT_LINUX;     // FreeBSD WNOWAIT=8 → Linux 0x01000000
+  }
   if ((options = XlatWait(options)) == -1) return -1;
   if ((opt_out_wstatus_addr && !IsValidMemory(m, opt_out_wstatus_addr,
                                               sizeof(gwstatusb), PROT_WRITE)) ||
@@ -4508,6 +4567,7 @@ static int SysUtimensat(struct Machine *m, i32 fd, i64 pathaddr, i64 tvsaddr,
   const char *path;
   struct timespec ts[2], *tsp;
   const struct timespec_linux *tv;
+  if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   if (!pathaddr) {
     path = 0;
   } else if (!(path = LoadStr(m, pathaddr))) {
@@ -5459,6 +5519,15 @@ static int SysFreeBSDSigprocmask(struct Machine* m, int how, i64 set,
   return SysSigprocmask(m, how - 1, set, oset, 8);
 }
 
+// FreeBSD sigsuspend takes a 4-byte sigset_t* (not 8-byte like Linux).
+// Read 4 bytes and zero-extend to 8 for compatibility.
+static int SysFreeBSDSigsuspend(struct Machine* m, i64 maskaddr) {
+  u8 word[8];
+  if (CopyFromUserRead(m, word, maskaddr, 4) == -1) return -1;
+  Write32(word + 4, 0);
+  return SigsuspendActual(m, Read64(word));
+}
+
 static int SysFreeBSDSysarch(struct Machine* m, int op, i64 parms) {
   SYS_LOGF("sysarch(%d, %#" PRIx64 ")", op, parms);
   return SysSysarch(m, op, parms);
@@ -5694,8 +5763,11 @@ static int SysFreeBSDFstatat(struct Machine* m, i32 dirfd, i64 pathaddr,
   int rc;
   struct stat st;
   const char* path;
+  // FreeBSD AT_SYMLINK_NOFOLLOW=0x200 differs from Linux AT_SYMLINK_NOFOLLOW=0x100
+  flags = XlatFreeBSDAtFlags(flags);
   if (!(path = LoadStr(m, pathaddr))) return -1;
-  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st, flags)) != -1) {
+  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st,
+                    XlatFstatatFlags(flags))) != -1) {
     WriteFreeBSDStat(m, addr, &st);
   }
   return rc;
@@ -5708,7 +5780,12 @@ static int SysFreeBSDThrSelf(struct Machine* m, i64 idaddr) {
 }
 
 static int SysFreeBSDThrKill(struct Machine* m, long id, int sig) {
-  return 0;  // stub
+  if (sig == 0) return 0;  // existence check only
+  // In single-threaded blink, TID matches the machine's tid
+  if (id == m->tid) {
+    return kill(getpid(), sig);
+  }
+  return 0;  // ignore signals to other threads
 }
 
 static int SysFreeBSDShmOpen2(struct Machine* m, i64 path, int flags, int mode,
@@ -5808,11 +5885,15 @@ static int SysFreeBSDCapRightsGet(struct Machine* m, i32 fd, i64 addr) {
 static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
                                i64 oldaddr) {
   int syssig;
+  int lsig;  // Linux signal number
   struct sigaction_linux hand;
   u8 fbsd_hand[32];
+  // Translate FreeBSD signal number to Linux signal number for hands[] indexing
+  lsig = XlatFreeBSDSignal(sig);
+  if (lsig < 1 || lsig > 64) return einval();
   if (oldaddr) {
     LOCK(&m->system->sig_lock);
-    hand = m->system->hands[sig - 1];
+    hand = m->system->hands[lsig - 1];
     UNLOCK(&m->system->sig_lock);
     memset(fbsd_hand, 0, 32);
     Write64(fbsd_hand + 0, Read64(hand.handler));
@@ -5827,8 +5908,8 @@ static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
     Write64(hand.flags, Read64(fbsd_hand + 8));
     Write64(hand.mask, Read64(fbsd_hand + 16));
     LOCK(&m->system->sig_lock);
-    m->system->hands[sig - 1] = hand;
-    if ((syssig = XlatSignal(sig)) != -1 && !IsBlinkSig(m->system, sig)) {
+    m->system->hands[lsig - 1] = hand;
+    if ((syssig = XlatSignal(lsig)) != -1 && !IsBlinkSig(m->system, lsig)) {
       struct sigaction syshand;
       sigfillset(&syshand.sa_mask);
       syshand.sa_flags = SA_SIGINFO;
@@ -5898,6 +5979,9 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       } else if (!strcmp(buf, "kern.domainname")) {
         oid[0] = 1;
         oid[1] = 22;
+      } else if (!strcmp(buf, "kern.argmax")) {
+        oid[0] = 1;
+        oid[1] = 8;
       } else {
         return enoent();
       }
@@ -5962,6 +6046,15 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
         rc = CopyToUserWrite(m, oldaddr, buf, size);
         free(buf);
         if (rc == -1) return -1;
+      }
+      return 0;
+    }
+    if (name[1] == 8 /* KERN_ARGMAX */) {
+      u32 argmax = 262144; /* 256KB, FreeBSD default */
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &argmax, 4) == -1) return -1;
+      if (oldlenaddr) {
+        u64 len = 4;
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
       }
       return 0;
     }
@@ -6130,6 +6223,15 @@ void OpSyscall(P) {
       case 2:
         ax = 0x39;
         break;  // fork
+      case 66:
+        ax = 0x3a;
+        break;  // vfork
+      case 42:
+        ax = 0x16;
+        break;  // pipe
+      case 542:
+        ax = 0x125;
+        break;  // pipe2
       case 3:
         ax = 0x00;
         break;  // read
@@ -6197,6 +6299,15 @@ void OpSyscall(P) {
       case 6:
         ax = 0x03;
         break;  // close
+      case 41:
+        ax = 0x20;
+        break;  // dup
+      case 90:
+        ax = 0x21;
+        break;  // dup2
+      case 330:
+        ax = 0x124;
+        break;  // dup3
       case 7:
         ax = 0x3d;
         break;  // wait4
@@ -6242,12 +6353,36 @@ void OpSyscall(P) {
       case 33:
         ax = 0x15;
         break;  // access
+      case 37:
+        ax = 0x3e;
+        break;  // kill
+      case 39:
+        ax = 0x6e;
+        break;  // getppid
+      case 43:
+        ax = 0x6c;
+        break;  // getegid
       case 47:
         ax = 0x68;
         break;  // getgid
-      case 49:
-        ax = 0x6c;
-        break;  // getegid
+      case 81:
+        ax = 0x6f;
+        break;  // getpgrp
+      case 82:
+        ax = 0x6d;
+        break;  // setpgid
+      case 99:
+        ax = 0x200;
+        break;  // sigsuspend (FreeBSD 4-byte sigset variant)
+      case 147:
+        ax = 0x70;
+        break;  // setsid
+      case 207:
+        ax = 0x79;
+        break;  // getpgid
+      case 532:
+        ax = 0x3d;
+        break;  // wait6 -> wait4 (approximate)
       case 136:
         ax = 0x53;
         break;  // mkdir
@@ -6266,6 +6401,9 @@ void OpSyscall(P) {
       case 93:
         ax = 0x17;
         break;  // select
+      case 209:
+        ax = 0x07;
+        break;  // poll
       case 123:
         ax = 0x5d;
         break;  // fchown
@@ -6342,6 +6480,9 @@ void OpSyscall(P) {
       case 433:
         ax = 0x1B1;
         break;  // thr_kill
+      case 563:
+        ax = 0x13e;
+        break;  // getrandom
       case 570:
         ax = 0x23a;
         break;  // shm_open2
@@ -6633,6 +6774,7 @@ void OpSyscall(P) {
     SYSCALL(5, 0x23a, "shm_open2", SysFreeBSDShmOpen2, STRACE_5);
     SYSCALL(1, 0x23d, "shm_unlink", SysFreeBSDShmUnlink, STRACE_1);
     SYSCALL(2, 392, "uuidgen", SysFreeBSDUuidgen, STRACE_2);
+    SYSCALL(1, 0x200, "sigsuspend", SysFreeBSDSigsuspend, STRACE_1);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
