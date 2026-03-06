@@ -353,6 +353,10 @@ static void ClearChildTid(struct Machine *m) {
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
   ClearChildTid(m);
+  if (m->system->vfork_done_fd) {
+    close(m->system->vfork_done_fd);
+    m->system->vfork_done_fd = 0;
+  }
   if (m->system->isfork) {
 #ifndef NDEBUG
     if (FLAG_statistics) {
@@ -517,9 +521,28 @@ static int SysFreeBSDpdfork(struct Machine* m, i64 fdpaddr, i32 flags) {
   return rc;
 }
 
-static int SysVfork(struct Machine* m) {
-  // TODO: Parent should be stopped while child is running.
-  return SysFork(m);
+static int SysVfork(struct Machine *m) {
+  int pid;
+  int pipefd[2];
+  char buf[1];
+  if (pipe2(pipefd, O_CLOEXEC) == -1) {
+    return SysFork(m);
+  }
+  pid = Fork(m, 0, 0, 0);
+  if (pid > 0) {
+    // Parent: block until child exec's or exits.
+    close(pipefd[1]);
+    (void)read(pipefd[0], buf, 1);
+    close(pipefd[0]);
+  } else if (pid == 0) {
+    // Child: save write end; it signals the parent when closed.
+    close(pipefd[0]);
+    m->system->vfork_done_fd = pipefd[1];
+  } else {
+    close(pipefd[0]);
+    close(pipefd[1]);
+  }
+  return pid;
 }
 
 static void *OnSpawn(void *arg) {
@@ -3753,6 +3776,10 @@ static void ExecveBlink(struct Machine *m, char *prog, char **argv,
       SysCloseExec(m->system);
       ResetTimerDispositions(m->system);
       ResetSignalDispositions(m->system);
+      if (m->system->vfork_done_fd) {
+        close(m->system->vfork_done_fd);
+        m->system->vfork_done_fd = 0;
+      }
       _Exit(m->system->exec(execfn, prog, argv, envp));
     }
     unassert(!pthread_sigmask(SIG_SETMASK, &m->system->exec_sigmask, 0));
@@ -5528,6 +5555,90 @@ static int SysFreeBSDSigsuspend(struct Machine* m, i64 maskaddr) {
   return SigsuspendActual(m, Read64(word));
 }
 
+// FreeBSD __realpathat(int fd, const char *path, char *buf, size_t size)
+// Resolves path to canonical form. We handle absolute paths directly;
+// for relative paths prepend cwd. No symlink resolution (simplified).
+static int SysFreeBSDRealpathat(struct Machine *m, i32 dirfd, i64 pathaddr,
+                                i64 bufaddr, i64 size) {
+  struct stat st;
+  const char *path;
+  char resolved[PATH_MAX];
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  if (VfsStat(GetDirFildes(dirfd), path, &st, 0) == -1) return -1;
+  if (path[0] == '/') {
+    if ((size_t)snprintf(resolved, sizeof(resolved), "%s", path) >=
+        sizeof(resolved)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+  } else {
+    char cwd[PATH_MAX];
+    if (!VfsGetcwd(cwd, sizeof(cwd))) return -1;
+    if ((size_t)snprintf(resolved, sizeof(resolved), "%s/%s", cwd, path) >=
+        sizeof(resolved)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+  }
+  size_t len = strlen(resolved);
+  if ((u64)len >= (u64)size) {
+    errno = ERANGE;
+    return -1;
+  }
+  if (CopyToUserWrite(m, bufaddr, resolved, len + 1) == -1) return -1;
+  return 0;
+}
+
+// FreeBSD _umtx_op: userspace mutex/condvar/rwlock operations (futex-like).
+// In blink's single-threaded emulation, we stub most operations.
+static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
+                               i64 uaddr1, i64 uaddr2) {
+  switch (op) {
+    case 1:   // UMTX_OP_UNLOCK (deprecated)
+    case 3:   // UMTX_OP_WAKE
+    case 5:   // UMTX_OP_MUTEX_UNLOCK
+    case 8:   // UMTX_OP_CV_SIGNAL
+    case 9:   // UMTX_OP_CV_BROADCAST
+    case 14:  // UMTX_OP_RW_UNLOCK
+    case 16:  // UMTX_OP_WAKE_PRIVATE
+    case 18:  // UMTX_OP_MUTEX_WAKE
+    case 21:  // UMTX_OP_SEM_WAKE
+    case 22:  // UMTX_OP_NWAKE_PRIVATE
+    case 23:  // UMTX_OP_MUTEX_WAKE2
+    case 26:  // UMTX_OP_SEM2_WAKE
+    case 27:  // UMTX_OP_SHM
+    case 28:  // UMTX_OP_ROBUST_LISTS
+      return 0;
+    case 4:   // UMTX_OP_MUTEX_TIMEDLOCK
+    case 6:   // UMTX_OP_SET_CEILING
+    case 12:  // UMTX_OP_RW_RDLOCK
+    case 13:  // UMTX_OP_RW_WRLOCK
+    case 17:  // UMTX_OP_MUTEX_WAIT
+    case 24:  // UMTX_OP_UMUTEX_TRYLOCK
+      return 0;  // pretend lock acquired (single-threaded blink)
+    case 2:   // UMTX_OP_WAIT
+    case 7:   // UMTX_OP_CV_WAIT
+    case 11:  // UMTX_OP_WAIT_UINT
+    case 15:  // UMTX_OP_WAIT_UINT_PRIVATE
+    case 20:  // UMTX_OP_SEM_WAIT
+    case 25:  // UMTX_OP_SEM2_WAIT
+      errno = EINTR;
+      return -1;
+    default:
+      return 0;
+  }
+}
+
+// FreeBSD thr_wake(long id): wake a thread. Stub — return 0.
+static int SysFreeBSDThrWake(struct Machine *m, long id) {
+  return 0;
+}
+
+// FreeBSD getcontext/rtprio_thread: stub
+static int SysFreeBSDStub0(struct Machine *m) {
+  return 0;
+}
+
 static int SysFreeBSDSysarch(struct Machine* m, int op, i64 parms) {
   SYS_LOGF("sysarch(%d, %#" PRIx64 ")", op, parms);
   return SysSysarch(m, op, parms);
@@ -6208,8 +6319,10 @@ void OpSyscall(P) {
   mark = m->freelist.n;
   m->interrupted = false;
   ax = Get64(m->ax);
+  u64 fbsd_syscall = 0;
   // FreeBSD syscall number translation
   if (m->system->isfreebsd) {
+    fbsd_syscall = ax;
     if (ax != 232 && ax != 340) {
       SYS_LOGF("FBSDRAX %" PRIu64 " di=%#" PRIx64 " si=%#" PRIx64
                " dx=%#" PRIx64 " r10=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64,
@@ -6546,6 +6659,64 @@ void OpSyscall(P) {
       case 134:
         ax = 0x30;
         break;  // shutdown
+      case 509:
+        // closefrom(int fd): close all fds >= fd
+        // Implement as close_range(fd, UINT_MAX, 0)
+        Put64(m->si, ~(u32)0);  // last = UINT_MAX
+        Put64(m->dx, 0);         // flags = 0
+        ax = 0x1B4;              // Linux close_range
+        break;
+      case 95:
+        ax = 0x4A;
+        break;  // fsync
+      case 550:
+        ax = 0x4B;
+        break;  // fdatasync
+      case 251:
+        ax = 0x3a;
+        break;  // rfork → vfork (approximate)
+      case 475:
+        ax = 0x11;
+        break;  // pread
+      case 476:
+        ax = 0x12;
+        break;  // pwrite
+      case 478:
+        ax = 0x08;
+        break;  // lseek (new-ABI variant, same as FreeBSD 19)
+      case 480:
+        ax = 0x4D;
+        break;  // ftruncate
+      case 421:
+        ax = 0x249;
+        break;  // getcontext (stub)
+      case 443:
+        ax = 0x248;
+        break;  // thr_wake
+      case 454:
+        ax = 0x247;
+        break;  // _umtx_op
+      case 466:
+        ax = 0x24a;
+        break;  // rtprio_thread (stub)
+      case 574:
+        ax = 0x246;
+        break;  // __realpathat
+      case 489:
+        ax = 0x1b7;
+        break;  // faccessat (4-arg, use faccessat2 which handles FreeBSD AT flags)
+      case 500:
+        ax = 0x10B;
+        break;  // readlinkat
+      case 501:
+        ax = 0x102;
+        break;  // mkdirat
+      case 502:
+        ax = 0x10A;
+        break;  // symlinkat
+      case 503:
+        ax = 0x109;
+        break;  // linkat
       default:
         break;
     }
@@ -6775,6 +6946,11 @@ void OpSyscall(P) {
     SYSCALL(1, 0x23d, "shm_unlink", SysFreeBSDShmUnlink, STRACE_1);
     SYSCALL(2, 392, "uuidgen", SysFreeBSDUuidgen, STRACE_2);
     SYSCALL(1, 0x200, "sigsuspend", SysFreeBSDSigsuspend, STRACE_1);
+    SYSCALL(4, 0x246, "__realpathat", SysFreeBSDRealpathat, STRACE_4);
+    SYSCALL(5, 0x247, "_umtx_op", SysFreeBSD_umtx_op, STRACE_5);
+    SYSCALL(1, 0x248, "thr_wake", SysFreeBSDThrWake, STRACE_1);
+    SYSCALL(0, 0x249, "getcontext", SysFreeBSDStub0, STRACE_0);
+    SYSCALL(0, 0x24a, "rtprio_thread", SysFreeBSDStub0, STRACE_0);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
@@ -6825,6 +7001,11 @@ void OpSyscall(P) {
   if (!m->interrupted) {
     if (m->system->isfreebsd) {
       if (ax != (u64)-1) {
+        // FreeBSD fork/vfork/rfork/pdfork kernel ABI: rdx=0 parent, rdx=1 child
+        if (fbsd_syscall == 2 || fbsd_syscall == 66 ||
+            fbsd_syscall == 251 || fbsd_syscall == 518) {
+          Put64(m->dx, ax == 0 ? 1 : 0);
+        }
         Put64(m->ax, ax);
         m->flags &= ~(1u << FLAGS_CF);
       } else {

@@ -271,6 +271,7 @@ struct System {
   bool iscosmo;
   bool isfreebsd;
   bool trapexit;
+  int vfork_done_fd;
   bool brkchanged;
   _Atomic(bool) killer;
   u16 gdt_limit;

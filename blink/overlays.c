@@ -79,6 +79,13 @@ static void FreeOverlays(void) {
   g_overlays = 0;
 }
 
+// strip all leading slashes from an absolute path to make it relative,
+// or return "." if the path is just slashes (i.e. the root directory)
+static const char *RelativizePath(const char *path) {
+  while (*path == '/') ++path;
+  return *path ? path : ".";
+}
+
 // if the user only specified a single overlay, then we treat it as
 // chroot would unless of course the specified root is the real one
 static bool IsRestrictedRoot(char **paths) {
@@ -236,7 +243,7 @@ int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
           continue;
         }
       }
-      if ((fd = openat(dirfd, !path[1] ? "." : path + 1, flags, mode)) != -1) {
+      if ((fd = openat(dirfd, RelativizePath(path), flags, mode)) != -1) {
         unassert(dup2(fd, dirfd) == dirfd);
         if (flags & O_CLOEXEC) {
           unassert(!fcntl(dirfd, F_SETFD, FD_CLOEXEC));
@@ -290,7 +297,7 @@ static ssize_t OverlaysGeneric(int dirfd, const char *path, void *args,
           continue;
         }
       }
-      if ((rc = fgenericat(dirfd, !path[1] ? "." : path + 1, args)) != -1) {
+      if ((rc = fgenericat(dirfd, RelativizePath(path), args)) != -1) {
         unassert(!close(dirfd));
         return rc;
       }
@@ -500,7 +507,7 @@ static ssize_t OverlaysGeneric2(int srcdirfd, const char *srcpath, int dstdirfd,
       srccloseme = -1;
       sp = srcpath;
     } else {
-      sp = !srcpath[1] ? "." : srcpath + 1;
+      sp = RelativizePath(srcpath);
       srccloseme = srcdirfd =
           open(g_overlays[j], O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
       if (srcdirfd == -1) {
@@ -522,7 +529,7 @@ static ssize_t OverlaysGeneric2(int srcdirfd, const char *srcpath, int dstdirfd,
         dstcloseme = -1;
         dp = dstpath;
       } else {
-        dp = !dstpath[1] ? "." : dstpath + 1;
+        dp = RelativizePath(dstpath);
         dstcloseme = dstdirfd =
             open(g_overlays[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
         if (dstdirfd == -1) {
