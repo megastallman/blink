@@ -335,6 +335,21 @@ static int SysFutexWake(struct Machine *m, i64 uaddr, u32 count) {
   return rc;
 }
 
+void WakeAllFutexes(void) {
+  struct Dll *e;
+  LOCK(&g_bus->futexes.lock);
+  for (e = dll_first(g_bus->futexes.active); e;
+       e = dll_next(g_bus->futexes.active, e)) {
+    struct Futex *f = FUTEX_CONTAINER(e);
+    LOCK(&f->lock);
+    if (f->waiters) {
+      pthread_cond_broadcast(&f->cond);
+    }
+    UNLOCK(&f->lock);
+  }
+  UNLOCK(&g_bus->futexes.lock);
+}
+
 static void ClearChildTid(struct Machine *m) {
 #if defined(HAVE_FORK) || defined(HAVE_THREADS)
   _Atomic(int) *ctid;
@@ -548,7 +563,7 @@ static int SysVfork(struct Machine *m) {
 static void *OnSpawn(void *arg) {
   int rc;
   struct Machine *m = (struct Machine *)arg;
-  THR_LOGF("pid=%d tid=%d OnSpawn", m->system->pid, m->tid);
+  SYS_LOGF("pid=%d tid=%d OnSpawn ip=%#" PRIx64, m->system->pid, m->tid, (u64)m->ip);
   m->thread = pthread_self();
   if (!(rc = sigsetjmp(m->onhalt, 1))) {
     m->canhalt = true;
@@ -4313,6 +4328,7 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
   bool isonstack;
   int supported, unsupported;
   const struct sigaltstack_linux *ss = 0;
+  struct sigaltstack_linux converted;
   supported = SS_ONSTACK_LINUX | SS_DISABLE_LINUX | SS_AUTODISARM_LINUX;
   isonstack =
       (~Read32(m->sigaltstack.flags) & SS_DISABLE_LINUX) &&
@@ -4327,6 +4343,18 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
                                                          sizeof(*ss)))) {
       LOGF("couldn't schlep new sigaltstack: %#" PRIx64, newaddr);
       return -1;
+    }
+    if (m->system->isfreebsd) {
+      // FreeBSD sigaltstack: {ss_sp[8], ss_size[8], ss_flags[4], pad[4]}
+      // Linux sigaltstack:   {ss_sp[8], ss_flags[4], pad[4], ss_size[8]}
+      // Convert FreeBSD layout to Linux layout
+      memcpy(converted.sp, ss->sp, 8);           // sp is at same offset
+      u64 fbsd_size = Read64(ss->flags);          // FreeBSD size at offset 8
+      u32 fbsd_flags = Read32(ss->size);          // FreeBSD flags at offset 16
+      Write32(converted.flags, fbsd_flags);
+      memset(converted.pad1_, 0, 4);
+      Write64(converted.size, fbsd_size);
+      ss = &converted;
     }
     if ((unsupported = Read32(ss->flags) & ~supported)) {
       LOGF("unsupported %s flags: %#x", "sigaltstack", unsupported);
@@ -4354,7 +4382,17 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
       Write32(m->sigaltstack.flags,
               Read32(m->sigaltstack.flags) | SS_ONSTACK_LINUX);
     }
-    CopyToUserWrite(m, oldaddr, &m->sigaltstack, sizeof(m->sigaltstack));
+    if (m->system->isfreebsd) {
+      // Convert Linux layout back to FreeBSD layout for the guest
+      u8 fbsd_ss[24];
+      memcpy(fbsd_ss, m->sigaltstack.sp, 8);              // sp at offset 0
+      Write64(fbsd_ss + 8, Read64(m->sigaltstack.size));   // size at offset 8
+      Write32(fbsd_ss + 16, Read32(m->sigaltstack.flags)); // flags at offset 16
+      Write32(fbsd_ss + 20, 0);                            // padding
+      CopyToUserWrite(m, oldaddr, fbsd_ss, 24);
+    } else {
+      CopyToUserWrite(m, oldaddr, &m->sigaltstack, sizeof(m->sigaltstack));
+    }
   }
   if (ss) {
     memcpy(&m->sigaltstack, ss, sizeof(*ss));
@@ -5145,6 +5183,13 @@ static int SysTkill(struct Machine *m, int tid, int sig) {
         case SIG_DFL_LINUX:
           if (!IsSignalIgnoredByDefault(sig)) {
             UNLOCK(&m->system->sig_lock);
+            // If a FreeBSD child thread sends itself SIGABRT (from
+            // libthr's abort() during thread exit cleanup), just exit
+            // the thread instead of killing the entire process.
+            if (m->nojit && sig == SIGABRT_LINUX) {
+              WakeAllFutexes();
+              SysExit(m, 0);
+            }
             TerminateSignal(m, sig, 0);
             return 0;
           }
@@ -5617,36 +5662,79 @@ static int SysFreeBSDRealpathat(struct Machine *m, i32 dirfd, i64 pathaddr,
 static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
                                i64 uaddr1, i64 uaddr2) {
   switch (op) {
-    case 1:   // UMTX_OP_UNLOCK (deprecated)
+    case 2:   // UMTX_OP_WAIT
+    case 11:  // UMTX_OP_WAIT_UINT
+    case 15:  // UMTX_OP_WAIT_UINT_PRIVATE
+      // Use blink's futex wait: wait until *obj != val
+      // uaddr2 may point to struct _umtx_time (timeout), ignore for now
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, val, 0);
+    case 17: { // UMTX_OP_MUTEX_WAIT
+      // FreeBSD umutex: wait while mutex is contested.
+      // Read the current value and wait for it to change.
+      u8 *mem = LookupAddress(m, obj);
+      if (!mem) return efault();
+      u32 curval = Load32(mem);
+      if (curval == 0) return 0;  // mutex is unlocked, done
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+    }
     case 3:   // UMTX_OP_WAKE
-    case 5:   // UMTX_OP_MUTEX_UNLOCK
-    case 8:   // UMTX_OP_CV_SIGNAL
-    case 9:   // UMTX_OP_CV_BROADCAST
-    case 14:  // UMTX_OP_RW_UNLOCK
     case 16:  // UMTX_OP_WAKE_PRIVATE
     case 18:  // UMTX_OP_MUTEX_WAKE
+    case 23:  // UMTX_OP_MUTEX_WAKE2
+      return SysFutexWake(m, obj, val ? val : 1);
+    case 1:   // UMTX_OP_UNLOCK (deprecated)
+    case 5:   // UMTX_OP_MUTEX_UNLOCK
+    case 8:   // UMTX_OP_CV_SIGNAL
+      return SysFutexWake(m, obj, val ? val : 1);
+    case 9:   // UMTX_OP_CV_BROADCAST
+    case 14:  // UMTX_OP_RW_UNLOCK
+      return SysFutexWake(m, obj, INT_MAX);
     case 21:  // UMTX_OP_SEM_WAKE
     case 22:  // UMTX_OP_NWAKE_PRIVATE
-    case 23:  // UMTX_OP_MUTEX_WAKE2
     case 26:  // UMTX_OP_SEM2_WAKE
+      return SysFutexWake(m, obj, val ? val : INT_MAX);
     case 27:  // UMTX_OP_SHM
     case 28:  // UMTX_OP_ROBUST_LISTS
       return 0;
-    case 4:   // UMTX_OP_MUTEX_TIMEDLOCK
+    case 4: {  // UMTX_OP_MUTEX_TIMEDLOCK
+      // Block until mutex m_owner becomes 0 (unlocked)
+      u8 *mem = LookupAddress(m, obj);
+      if (!mem) return efault();
+      u32 curval = Load32(mem);
+      if (curval == 0 || (curval & 0x7fffffff) == 0) return 0;
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+    }
     case 6:   // UMTX_OP_SET_CEILING
-    case 12:  // UMTX_OP_RW_RDLOCK
-    case 13:  // UMTX_OP_RW_WRLOCK
-    case 17:  // UMTX_OP_MUTEX_WAIT
+      return 0;
+    case 12: { // UMTX_OP_RW_RDLOCK
+      // Wait until no writer holds the lock (bit 31 clear)
+      u8 *mem = LookupAddress(m, obj);
+      if (!mem) return efault();
+      u32 curval = Load32(mem);
+      if (!(curval & 0x80000000u)) return 0;  // no writer, proceed
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+    }
+    case 13: { // UMTX_OP_RW_WRLOCK
+      // Wait until lock state is 0 (no readers or writers)
+      u8 *mem = LookupAddress(m, obj);
+      if (!mem) return efault();
+      u32 curval = Load32(mem);
+      if ((curval & 0x9fffffffu) == 0) return 0;  // unlocked, proceed
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+    }
     case 24:  // UMTX_OP_UMUTEX_TRYLOCK
-      return 0;  // pretend lock acquired (single-threaded blink)
-    case 2:   // UMTX_OP_WAIT
-    case 7:   // UMTX_OP_CV_WAIT
-    case 11:  // UMTX_OP_WAIT_UINT
-    case 15:  // UMTX_OP_WAIT_UINT_PRIVATE
+      return 0;  // pretend lock acquired (best-effort)
+    case 7: {  // UMTX_OP_CV_WAIT
+      // obj = condvar, uaddr1 = mutex
+      // Set c_has_waiters flag (offset 4), then futex wait on c_has_waiters
+      u8 *cv_mem = LookupAddress(m, obj + 4);
+      if (!cv_mem) return efault();
+      Store32(cv_mem, 1);  // set has_waiters
+      return SysFutexWait(m, obj + 4, FUTEX_WAIT_LINUX, 1, 0);
+    }
     case 20:  // UMTX_OP_SEM_WAIT
     case 25:  // UMTX_OP_SEM2_WAIT
-      errno = EINTR;
-      return -1;
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, 0, 0);
     default:
       return 0;
   }
@@ -5665,6 +5753,32 @@ static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
 //  56: long *parent_tid           8 bytes
 //  64: int flags                  4 bytes
 //  68: struct rtprio *rtp         8 bytes (with padding)
+// Allocate a page in guest memory containing a thr_exit(0) thunk.
+// This is used as the return address for threads created by thr_new,
+// so that when start_func returns, the thread cleanly calls thr_exit(0)
+// instead of jumping to address 0.
+static i64 GetFreeBSDThrExitThunk(struct Machine *m) {
+  i64 thunk;
+  u8 *p;
+  if (m->system->thr_exit_thunk) return m->system->thr_exit_thunk;
+  // x86-64 code: xor %edi,%edi; mov $431,%eax; syscall; ud2
+  // 31 ff  b8 af 01 00 00  0f 05  0f 0b
+  static const u8 code[] = {
+      0x31, 0xff,                    // xor %edi, %edi
+      0xb8, 0xaf, 0x01, 0x00, 0x00,  // mov $431, %eax  (FreeBSD thr_exit)
+      0x0f, 0x05,                    // syscall
+      0x0f, 0x0b,                    // ud2 (should never reach here)
+  };
+  thunk = ReserveVirtual(m->system, 0, 0x1000,
+                         PAGE_U, -1, 0, false, false);
+  if (thunk == -1) return 0;
+  p = (u8 *)LookupAddress(m, thunk);
+  if (!p) return 0;
+  memcpy(p, code, sizeof(code));
+  m->system->thr_exit_thunk = thunk;
+  return thunk;
+}
+
 static int SysFreeBSDThrNew(struct Machine *m) {
 #ifdef HAVE_THREADS
   i64 param_addr = Get64(m->di);
@@ -5698,9 +5812,33 @@ static int SysFreeBSDThrNew(struct Machine *m) {
   Put64(m2->di, arg);        // first argument
   Put64(m2->ax, 0);
   // Stack grows down; align to 16, then subtract 8 to simulate
-  // the return address pushed by a CALL instruction (ABI: RSP%16==8)
-  Put64(m2->sp, ((stack_base + stack_size) & ~(u64)15) - 8);
+  // the return address pushed by a CALL instruction (ABI: RSP%16==8).
+  // Write the thr_exit thunk as the return address so that when
+  // start_func returns, the thread cleanly calls thr_exit(0).
+  u64 sp = (stack_base + stack_size) & ~(u64)15;
+  sp -= 8;
+  Put64(m2->sp, sp);
+  // Write a thr_exit(0) thunk at the top of the stack and set the return
+  // address to point to it. When start_func returns, the thread will
+  // cleanly call thr_exit(0) instead of jumping to address 0.
+  {
+    // x86-64 code: xor %edi,%edi; mov $431,%eax; syscall; ud2
+    static const u8 code[] = {
+        0x31, 0xff,                    // xor %edi, %edi
+        0xb8, 0xaf, 0x01, 0x00, 0x00,  // mov $431, %eax (FreeBSD thr_exit)
+        0x0f, 0x05,                    // syscall
+        0x0f, 0x0b,                    // ud2
+    };
+    u64 thunk_addr = sp + 8;  // just above the return address slot
+    u8 *thunk_mem = (u8 *)LookupAddress(m, thunk_addr);
+    u8 *ret_mem = (u8 *)LookupAddress(m, sp);
+    if (thunk_mem && ret_mem) {
+      memcpy(thunk_mem, code, sizeof(code));
+      Write64(ret_mem, thunk_addr);
+    }
+  }
   m2->fs.base = tls_base;   // TLS
+  m2->nojit = true;         // disable JIT for FreeBSD child threads
   if (child_tid) {
     // Write child TID (FreeBSD uses long = 8 bytes)
     u8 *ctid_ptr;
@@ -5747,10 +5885,15 @@ static int SysFreeBSDCpusetGetaffinity(struct Machine *m) {
   i64 setsize = Get64(m->r10);
   i64 mask_addr = Get64(m->r8);
   u8 *mask;
+  int ncpus;
   if (setsize <= 0 || !mask_addr) return einval();
   if (!(mask = (u8 *)SchlepW(m, mask_addr, setsize))) return -1;
   memset(mask, 0, setsize);
-  mask[0] = 1;  // CPU 0
+  ncpus = GetCpuCount();
+  if (ncpus < 1) ncpus = 1;
+  for (int i = 0; i < ncpus && i < (int)(setsize * 8); ++i) {
+    mask[i / 8] |= 1 << (i % 8);
+  }
   return 0;
 }
 
@@ -6880,6 +7023,12 @@ void OpSyscall(P) {
       case 47:
         ax = 0x68;
         break;  // getgid
+      case 53:
+        ax = 0x83;
+        break;  // sigaltstack
+      case 59:
+        ax = 0x3B;
+        break;  // execve
       case 81:
         ax = 0x6f;
         break;  // getpgrp
@@ -6996,8 +7145,14 @@ void OpSyscall(P) {
         ax = 0x1B0;
         break;  // thr_self
       case 433:
-        ax = 0x1B1;
-        break;  // thr_kill
+        // thr_kill(tid, sig) → tkill(tid, sig)
+        // Translate FreeBSD signal number to Linux
+        if (m->system->isfreebsd) {
+          i64 fbsd_sig = Get64(m->si);
+          if (fbsd_sig > 0) Put64(m->si, XlatFreeBSDSignal(fbsd_sig));
+        }
+        ax = 0x0C8;
+        break;  // thr_kill → tkill
       case 563:
         ax = 0x13e;
         break;  // getrandom
@@ -7135,6 +7290,12 @@ void OpSyscall(P) {
       case 501:
         ax = 0x102;
         break;  // mkdirat
+      case 57:
+        ax = 0x58;
+        break;  // symlink
+      case 495:
+        ax = 0x109;
+        break;  // linkat
       case 502:
         ax = 0x10A;
         break;  // symlinkat

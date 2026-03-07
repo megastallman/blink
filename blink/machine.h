@@ -272,6 +272,7 @@ struct System {
   bool isfreebsd;
   bool emulate_root;
   bool trapexit;
+  i64 thr_exit_thunk;
   int vfork_done_fd;
   bool brkchanged;
   _Atomic(bool) killer;
@@ -441,6 +442,7 @@ struct Machine {               //
   bool traprdtsc;                        //
   bool trapcpuid;                        //
   bool boop;                             //
+  bool nojit;                            // per-machine jit disable
   i8 trapno;                             //
   i8 segvcode;                           //
   struct MachineTlb tlb[32];             //

@@ -2091,7 +2091,7 @@ nexgen32e_f GetOp(long op) {
 }
 
 static bool CanJit(struct Machine *m) {
-  return !IsJitDisabled(&m->system->jit);
+  return !m->nojit && !IsJitDisabled(&m->system->jit);
 }
 
 void JitlessDispatch(P) {
