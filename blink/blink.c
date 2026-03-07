@@ -90,7 +90,7 @@ Toolchain: " BUILD_TOOLCHAIN "\n\
 Revision: #" BLINK_COMMITS " " BLINK_GITSHA "\n\
 Config: ./configure MODE=" BUILD_MODE " " CONFIG_ARGUMENTS "\n"
 
-#define OPTS "hvjemZs0L:C:"
+#define OPTS "hvjemZs0RL:C:"
 
 _Alignas(1) static const char USAGE[] =
     " [-" OPTS "] PROG [ARGS...]\n"
@@ -105,6 +105,7 @@ _Alignas(1) static const char USAGE[] =
 #endif
     "  -0                   to specify argv[0]\n"
     "  -m                   enable memory safety\n"
+    "  -R                   emulate root user (uid/gid 0)\n"
 #if !defined(DISABLE_STRACE) && !defined(TINY)
     "  -s                   enable system call logging\n"
 #endif
@@ -132,6 +133,7 @@ _Alignas(1) static const char USAGE[] =
 
 extern char **environ;
 static bool FLAG_nojit;
+static bool FLAG_asroot;
 static char g_pathbuf[PATH_MAX];
 
 static void OnSigSys(int sig) {
@@ -212,6 +214,7 @@ static int Exec(char *execfn, char *prog, char **argv, char **envp) {
   if (FLAG_nojit) DisableJit(&m->system->jit);
 #endif
   m->system->exec = Exec;
+  m->system->emulate_root = FLAG_asroot;
   if (!old) {
     // this is the first time a program is being loaded
     LoadProgram(m, execfn, prog, argv, envp, NULL);
@@ -289,6 +292,9 @@ static void GetOpts(int argc, char *argv[]) {
         break;
       case 'm':
         FLAG_nolinear = true;
+        break;
+      case 'R':
+        FLAG_asroot = true;
         break;
       case 'Z':
         FLAG_statistics = true;

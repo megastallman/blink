@@ -687,6 +687,27 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return VfsIoctl(fildes, TCSBRK, (void *)1L);
     case FBSD_TIOCFLUSH:
       return 0;
+    case 0x8004667eu: {  // FreeBSD FIONBIO
+      const u8 *p;
+      int val = 1;
+      if (addr && (p = (const u8 *)SchlepR(m, addr, 4))) {
+        val = Read32(p);
+      }
+      if (val) {
+        return IoctlFionbio(m, fildes);
+      } else {
+        // Clear non-blocking
+        int oflags;
+        if ((oflags = GetOflags(m, fildes)) == -1) return -1;
+        return VfsFcntl(fildes, F_SETFL, (oflags & SETFL_FLAGS) & ~O_NDELAY);
+      }
+    }
+    case 0x20006601u:  // FreeBSD FIOCLEX
+      return IoctlFioclex(m, fildes);
+    case 0x20006602u:  // FreeBSD FIONCLEX
+      return IoctlFionclex(m, fildes);
+    case 0x4004667fu:  // FreeBSD FIONREAD
+      return IoctlGetInt32(m, fildes, FIONREAD, addr);
     default:
       LOGF("missing ioctl %#" PRIx64, request);
       return einval();

@@ -270,6 +270,7 @@ struct System {
   bool loaded;
   bool iscosmo;
   bool isfreebsd;
+  bool emulate_root;
   bool trapexit;
   int vfork_done_fd;
   bool brkchanged;
