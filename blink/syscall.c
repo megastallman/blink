@@ -267,6 +267,11 @@ bool CheckInterrupt(struct Machine *m, bool restartable) {
   bool res, restart;
   int sig, delivered;
   // an actual i/o call just received EINTR from the kernel
+  // if we're being killed, exit the thread immediately rather than
+  // returning EINTR to guest code which may corrupt its state
+  if (atomic_load_explicit(&m->killed, memory_order_acquire)) {
+    SysExit(m, 0);
+  }
 HandleSomeMoreInterrupts:
   // determine if there's any signals pending for our guest
   Put64(m->ax, -EINTR_LINUX);
@@ -412,6 +417,7 @@ _Noreturn void SysExit(struct Machine *m, int rc) {
   } else {
     ClearChildTid(m);
     FreeMachine(m);
+    WakeAllFutexes();
     pthread_exit(EXIT_SUCCESS);
   }
 #else
@@ -1819,7 +1825,22 @@ static int XlatSendFlags(int flags, int socktype) {
   return hostflags;
 }
 
-// FreeBSD MSG flags differ from Linux MSG flags for many values.
+// FreeBSD MSG send flags differ from Linux MSG flags for many values.
+// FreeBSD: OOB=0x1 DONTROUTE=0x4 EOR=0x8 DONTWAIT=0x80 EOF=0x100
+//          NOSIGNAL=0x20000
+// Linux:   OOB=0x1 DONTROUTE=0x4 EOR=0x80 DONTWAIT=0x40
+//          NOSIGNAL=0x4000
+static int XlatFreeBSDSendFlags(int flags) {
+  int out = 0;
+  if (flags & 0x001) out |= MSG_OOB_LINUX;
+  if (flags & 0x004) out |= MSG_DONTROUTE_LINUX;
+  if (flags & 0x008) out |= MSG_EOR_LINUX;
+  if (flags & 0x080) out |= MSG_DONTWAIT_LINUX;
+  if (flags & 0x20000) out |= MSG_NOSIGNAL_LINUX;
+  return out;
+}
+
+// FreeBSD MSG recv flags differ from Linux MSG flags for many values.
 // FreeBSD: OOB=0x1 PEEK=0x2 TRUNC=0x10 WAITALL=0x40 DONTWAIT=0x80
 //          CMSG_CLOEXEC=0x40000
 // Linux:   OOB=0x1 PEEK=0x2 TRUNC=0x20 WAITALL=0x100 DONTWAIT=0x40
@@ -2003,6 +2024,7 @@ static i64 SysSendto(struct Machine *m,  //
   UNLOCK(&m->system->fds.lock);
   if (!fd) return ebadf();
   if (sockaddr_size < 0) return einval();
+  if (m->system->isfreebsd) flags = XlatFreeBSDSendFlags(flags);
   if ((hostflags = XlatSendFlags(flags, socktype)) == -1) return -1;
   memset(&msg, 0, sizeof(msg));
   // "If sendto() is used on a connection-mode socket, the arguments
@@ -2085,6 +2107,7 @@ static i64 SysSendmsg(struct Machine *m, i32 fildes, i64 msgaddr, i32 flags) {
   }
   UNLOCK(&m->system->fds.lock);
   if (!fd) return ebadf();
+  if (m->system->isfreebsd) flags = XlatFreeBSDSendFlags(flags);
   if ((flags = XlatSendFlags(flags, socktype)) == -1) return -1;
   if (!(gm = (const struct msghdr_linux *)SchlepR(m, msgaddr, sizeof(*gm)))) {
     return -1;
@@ -2401,7 +2424,13 @@ static int SysSetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   int syslevel, sysoptname;
   if (m->system->isfreebsd) {
     level = XlatFreeBSDSocketLevel(level);
-    if (level == SOL_SOCKET_LINUX) optname = XlatFreeBSDSocketOptname(optname);
+    if (level == SOL_SOCKET_LINUX) {
+      // FreeBSD SO_NOSIGPIPE (0x800) has no Linux equivalent; Linux uses
+      // MSG_NOSIGNAL per-send instead, which we already translate. Silently
+      // succeed so SSL libraries (which set SO_NOSIGPIPE) don't bail out.
+      if (optname == 0x800u) return 0;
+      optname = XlatFreeBSDSocketOptname(optname);
+    }
   }
   switch (level) {
     case SOL_SOCKET_LINUX:
@@ -2442,7 +2471,20 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   int syslevel, sysoptname;
   if (m->system->isfreebsd) {
     level = XlatFreeBSDSocketLevel(level);
-    if (level == SOL_SOCKET_LINUX) optname = XlatFreeBSDSocketOptname(optname);
+    if (level == SOL_SOCKET_LINUX) {
+      if (optname == 0x800u) {
+        // SO_NOSIGPIPE: report as enabled (we translate MSG_NOSIGNAL)
+        u8 *psize, gval[4];
+        if (!(psize = (u8 *)SchlepRW(m, optvalsizeaddr, 4))) return -1;
+        u32 gsz = Read32(psize);
+        if (!IsValidMemory(m, optvaladdr, gsz, PROT_WRITE)) return -1;
+        Write32(gval, 1);
+        CopyToUserWrite(m, optvaladdr, gval, MIN(4u, gsz));
+        Write32(psize, 4);
+        return 0;
+      }
+      optname = XlatFreeBSDSocketOptname(optname);
+    }
   }
   switch (level) {
     case SOL_SOCKET_LINUX:
@@ -3109,12 +3151,14 @@ static int XlatFchownatFlags(int x) {
 }
 
 static int SysFchown(struct Machine *m, i32 fildes, u32 uid, u32 gid) {
+  if (m->system->emulate_root) return 0;
   return VfsFchown(fildes, uid, gid);
 }
 
 static int SysFchownat(struct Machine *m, i32 dirfd, i64 pathaddr, u32 uid,
                        u32 gid, i32 flags) {
   const char *path;
+  if (m->system->emulate_root) return 0;
   if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
   if (!(path = LoadStr(m, pathaddr))) return -1;
 #ifndef DISABLE_NONPOSIX
@@ -3305,8 +3349,34 @@ static int SysFchmod(struct Machine *m, i32 fd, u32 mode) {
 }
 
 static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
-  return VfsChmod(GetDirFildes(dirfd), LoadStr(m, path), mode, 0);
+  int flags = 0;
+  if (m->system->isfreebsd) {
+    i32 bsdflags = (i32)Get64(m->r10);
+    flags = XlatFreeBSDAtFlags(bsdflags);
+  }
+  const char *p = LoadStr(m, path);
+  if (!p) return -1;
+  // On Linux, chmod on a symlink with AT_SYMLINK_NOFOLLOW is not supported.
+  // If it's a symlink and caller wants nofollow, just return success.
+  if (flags & AT_SYMLINK_NOFOLLOW_LINUX) {
+    struct stat st;
+    if (fstatat(GetDirFildes(dirfd), p, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISLNK(st.st_mode)) {
+      return 0;
+    }
+  }
+  return VfsChmod(GetDirFildes(dirfd), p, mode, flags);
 }
+
+// FreeBSD struct flock layout: start(8) len(8) pid(4) type(2) whence(2) sysid(4)
+struct flock_freebsd {
+  u8 start[8];
+  u8 len[8];
+  u8 pid[4];
+  u8 type[2];
+  u8 whence[2];
+  u8 sysid[4];
+};
 
 static int SysFcntlLock(struct Machine *m, int systemfd, int cmd, i64 arg) {
   int rc;
@@ -3314,7 +3384,28 @@ static int SysFcntlLock(struct Machine *m, int systemfd, int cmd, i64 arg) {
   int syscmd;
   struct flock flock;
   struct flock_linux flock_linux;
-  if (CopyFromUserRead(m, &flock_linux, arg, sizeof(flock_linux))) {
+  if (m->system->isfreebsd) {
+    // FreeBSD flock layout and type values differ from Linux:
+    //   FreeBSD: F_RDLCK=1 F_UNLCK=2 F_WRLCK=3
+    //   Linux:   F_RDLCK=0 F_WRLCK=1 F_UNLCK=2
+    struct flock_freebsd fbsd;
+    u16 fbsd_type;
+    if (CopyFromUserRead(m, &fbsd, arg, sizeof(fbsd))) return -1;
+    fbsd_type = Read16(fbsd.type);
+    if (fbsd_type == 1) {
+      Write16(flock_linux.type, F_RDLCK_LINUX);
+    } else if (fbsd_type == 2) {
+      Write16(flock_linux.type, F_UNLCK_LINUX);
+    } else if (fbsd_type == 3) {
+      Write16(flock_linux.type, F_WRLCK_LINUX);
+    } else {
+      return einval();
+    }
+    Write16(flock_linux.whence, Read16(fbsd.whence));
+    Write64(flock_linux.start, Read64(fbsd.start));
+    Write64(flock_linux.len, Read64(fbsd.len));
+    Write32(flock_linux.pid, Read32(fbsd.pid));
+  } else if (CopyFromUserRead(m, &flock_linux, arg, sizeof(flock_linux))) {
     return -1;
   }
   if (cmd == F_SETLK_LINUX) {
@@ -3340,24 +3431,43 @@ static int SysFcntlLock(struct Machine *m, int systemfd, int cmd, i64 arg) {
   flock.l_len = Read64(flock_linux.len);
   RESTARTABLE(rc = VfsFcntl(systemfd, syscmd, &flock));
   if (rc != -1 && syscmd == F_GETLK) {
+    u16 gtype, gwhence;
     if (flock.l_type == F_RDLCK) {
-      Write16(flock_linux.type, F_RDLCK_LINUX);
+      gtype = F_RDLCK_LINUX;
     } else if (flock.l_type == F_WRLCK) {
-      Write16(flock_linux.type, F_WRLCK_LINUX);
+      gtype = F_WRLCK_LINUX;
     } else {
-      Write16(flock_linux.type, F_UNLCK_LINUX);
+      gtype = F_UNLCK_LINUX;
     }
     if (flock.l_whence == SEEK_END) {
-      Write16(flock_linux.whence, SEEK_END_LINUX);
+      gwhence = SEEK_END_LINUX;
     } else if (flock.l_whence == SEEK_CUR) {
-      Write16(flock_linux.whence, SEEK_CUR_LINUX);
+      gwhence = SEEK_CUR_LINUX;
     } else {
-      Write16(flock_linux.whence, SEEK_SET_LINUX);
+      gwhence = SEEK_SET_LINUX;
     }
-    Write64(flock_linux.start, flock.l_start);
-    Write64(flock_linux.len, flock.l_len);
-    Write32(flock_linux.pid, flock.l_pid);
-    CopyToUserWrite(m, arg, &flock_linux, sizeof(flock_linux));
+    if (m->system->isfreebsd) {
+      struct flock_freebsd fbsd;
+      u16 fbsd_type;
+      // Convert Linux type back to FreeBSD type
+      if (gtype == F_RDLCK_LINUX) fbsd_type = 1;
+      else if (gtype == F_WRLCK_LINUX) fbsd_type = 3;
+      else fbsd_type = 2;  // F_UNLCK
+      memset(&fbsd, 0, sizeof(fbsd));
+      Write16(fbsd.type, fbsd_type);
+      Write16(fbsd.whence, gwhence);
+      Write64(fbsd.start, flock.l_start);
+      Write64(fbsd.len, flock.l_len);
+      Write32(fbsd.pid, flock.l_pid);
+      CopyToUserWrite(m, arg, &fbsd, sizeof(fbsd));
+    } else {
+      Write16(flock_linux.type, gtype);
+      Write16(flock_linux.whence, gwhence);
+      Write64(flock_linux.start, flock.l_start);
+      Write64(flock_linux.len, flock.l_len);
+      Write32(flock_linux.pid, flock.l_pid);
+      CopyToUserWrite(m, arg, &flock_linux, sizeof(flock_linux));
+    }
   }
   return rc;
 }
@@ -3903,6 +4013,19 @@ static int SysGetrusage(struct Machine *m, i32 resource, i64 rusageaddr) {
   return rc;
 }
 
+// FreeBSD RLIMIT constants 6-10 differ from Linux:
+//   FreeBSD: MEMLOCK=6 NPROC=7 NOFILE=8 SBSIZE=9 AS=10
+//   Linux:   NPROC=6   NOFILE=7 MEMLOCK=8 AS=9
+static int XlatFreeBSDResource(int r) {
+  switch (r) {
+    case 6: return RLIMIT_MEMLOCK_LINUX;  // MEMLOCK
+    case 7: return RLIMIT_NPROC_LINUX;    // NPROC
+    case 8: return RLIMIT_NOFILE_LINUX;   // NOFILE
+    case 10: return RLIMIT_AS_LINUX;      // AS/VMEM
+    default: return r;  // 0-5 are same
+  }
+}
+
 static bool IsSupportedResourceLimit(int resource) {
   return resource == RLIMIT_AS_LINUX ||    //
          resource == RLIMIT_DATA_LINUX ||  //
@@ -3935,6 +4058,7 @@ static int SysGetrlimit(struct Machine *m, i32 resource, i64 rlimitaddr) {
   int rc;
   struct rlimit rlim;
   struct rlimit_linux lux;
+  if (m->system->isfreebsd) resource = XlatFreeBSDResource(resource);
   if (IsSupportedResourceLimit(resource)) {
     GetResourceLimit_(m, resource, &lux);
     return CopyToUserWrite(m, rlimitaddr, &lux, sizeof(lux));
@@ -3950,6 +4074,7 @@ static int SysSetrlimit(struct Machine *m, i32 resource, i64 rlimitaddr) {
   int sysresource;
   struct rlimit rlim;
   const struct rlimit_linux *lux;
+  if (m->system->isfreebsd) resource = XlatFreeBSDResource(resource);
   if (!(lux = (const struct rlimit_linux *)SchlepR(m, rlimitaddr,
                                                    sizeof(*lux)))) {
     return -1;
@@ -5342,6 +5467,7 @@ static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
 }
 
 static i32 SysSetgroups(struct Machine *m, i32 size, i64 addr) {
+  if (m->system->emulate_root) return 0;
 #ifdef HAVE_SETGROUPS
   int i;
   gid_t *group;
@@ -5363,6 +5489,7 @@ static i32 SysSetresuid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+  if (m->system->emulate_root) return 0;
 #ifdef HAVE_SETRESUID
   return setresuid(real, effective, saved);
 #elif defined(HAVE_SETREUID)
@@ -5382,6 +5509,7 @@ static i32 SysSetresgid(struct Machine *m,  //
                         u32 real,           //
                         u32 effective,      //
                         u32 saved) {
+  if (m->system->emulate_root) return 0;
 #ifdef HAVE_SETRESGID
   return setresgid(real, effective, saved);
 #elif defined(HAVE_SETREGID)
@@ -5492,10 +5620,12 @@ static int SysUmask(struct Machine *m, int mask) {
 }
 
 static int SysSetuid(struct Machine *m, int uid) {
+  if (m->system->emulate_root) return 0;
   return setuid(uid);
 }
 
 static int SysSetgid(struct Machine *m, int gid) {
+  if (m->system->emulate_root) return 0;
   return setgid(gid);
 }
 
@@ -5661,80 +5791,110 @@ static int SysFreeBSDRealpathat(struct Machine *m, i32 dirfd, i64 pathaddr,
 // In blink's single-threaded emulation, we stub most operations.
 static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
                                i64 uaddr1, i64 uaddr2) {
+  if (m->killed) return eintr();
+  // Op numbers from FreeBSD sys/umtx.h:
+  //  0=LOCK  1=UNLOCK  2=WAIT  3=WAKE  4=MUTEX_TRYLOCK  5=MUTEX_LOCK
+  //  6=MUTEX_UNLOCK  7=SET_CEILING  8=CV_WAIT  9=CV_SIGNAL  10=CV_BROADCAST
+  // 11=WAIT_UINT  12=RW_RDLOCK  13=RW_WRLOCK  14=RW_UNLOCK
+  // 15=WAIT_UINT_PRIVATE  16=WAKE_PRIVATE  17=MUTEX_WAIT  18=MUTEX_WAKE
+  // 19=SEM_WAIT  20=SEM_WAKE  21=NWAKE_PRIVATE  22=MUTEX_WAKE2
+  // 23=SEM2_WAIT  24=SEM2_WAKE  25=SHM  26=ROBUST_LISTS
   switch (op) {
     case 2:   // UMTX_OP_WAIT
     case 11:  // UMTX_OP_WAIT_UINT
-    case 15:  // UMTX_OP_WAIT_UINT_PRIVATE
-      // Use blink's futex wait: wait until *obj != val
-      // uaddr2 may point to struct _umtx_time (timeout), ignore for now
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, val, 0);
-    case 17: { // UMTX_OP_MUTEX_WAIT
-      // FreeBSD umutex: wait while mutex is contested.
-      // Read the current value and wait for it to change.
+    case 15: { // UMTX_OP_WAIT_UINT_PRIVATE
       u8 *mem = LookupAddress(m, obj);
       if (!mem) return efault();
       u32 curval = Load32(mem);
-      if (curval == 0) return 0;  // mutex is unlocked, done
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+      if (curval != (u32)val) return eagain();
+      if (IsOrphan(m)) { Store32(mem, 0); return 0; }
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, val, 0);
     }
     case 3:   // UMTX_OP_WAKE
     case 16:  // UMTX_OP_WAKE_PRIVATE
-    case 18:  // UMTX_OP_MUTEX_WAKE
-    case 23:  // UMTX_OP_MUTEX_WAKE2
       return SysFutexWake(m, obj, val ? val : 1);
-    case 1:   // UMTX_OP_UNLOCK (deprecated)
-    case 5:   // UMTX_OP_MUTEX_UNLOCK
-    case 8:   // UMTX_OP_CV_SIGNAL
-      return SysFutexWake(m, obj, val ? val : 1);
-    case 9:   // UMTX_OP_CV_BROADCAST
-    case 14:  // UMTX_OP_RW_UNLOCK
-      return SysFutexWake(m, obj, INT_MAX);
-    case 21:  // UMTX_OP_SEM_WAKE
-    case 22:  // UMTX_OP_NWAKE_PRIVATE
-    case 26:  // UMTX_OP_SEM2_WAKE
-      return SysFutexWake(m, obj, val ? val : INT_MAX);
-    case 27:  // UMTX_OP_SHM
-    case 28:  // UMTX_OP_ROBUST_LISTS
-      return 0;
-    case 4: {  // UMTX_OP_MUTEX_TIMEDLOCK
-      // Block until mutex m_owner becomes 0 (unlocked)
+    case 4: { // UMTX_OP_MUTEX_TRYLOCK
+      u8 *mem = LookupAddress(m, obj);
+      if (!mem) return efault();
+      if ((Load32(mem) & 0x7fffffffu) == 0) return 0;
+      return -(EBUSY_LINUX);
+    }
+    case 5:   // UMTX_OP_MUTEX_LOCK
+    case 17: { // UMTX_OP_MUTEX_WAIT
+      // Wait until mutex owner TID (bits 0-30) is 0.
+      // Use short sleep instead of futex wait: without the CONTESTED bit
+      // the owner won't call MUTEX_WAKE2, so futex degrades to 50ms polling.
+      // A 1ms sleep is much faster while avoiding CPU-burning spin.
       u8 *mem = LookupAddress(m, obj);
       if (!mem) return efault();
       u32 curval = Load32(mem);
-      if (curval == 0 || (curval & 0x7fffffff) == 0) return 0;
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+      if ((curval & 0x7fffffffu) == 0) return 0;
+      if (IsOrphan(m)) { Store32(mem, 0); return 0; }
+      usleep(1000);
+      return 0;
     }
-    case 6:   // UMTX_OP_SET_CEILING
+    case 1:   // UMTX_OP_UNLOCK (deprecated)
+    case 6:   // UMTX_OP_MUTEX_UNLOCK
+      // Userspace already cleared m_owner via CAS; just wake a waiter
+      return SysFutexWake(m, obj, 1);
+    case 7:   // UMTX_OP_SET_CEILING
+      return 0;
+    case 8: { // UMTX_OP_CV_WAIT
+      // Return spurious wakeup to let caller re-check predicate.
+      // Using futex wait has lost-wakeup issues since we can't atomically
+      // unlock the mutex and sleep like the real kernel does.
+      if (IsOrphan(m)) return 0;
+      usleep(1000);
+      return 0;
+    }
+    case 9:   // UMTX_OP_CV_SIGNAL
+    case 10:  // UMTX_OP_CV_BROADCAST
       return 0;
     case 12: { // UMTX_OP_RW_RDLOCK
-      // Wait until no writer holds the lock (bit 31 clear)
       u8 *mem = LookupAddress(m, obj);
       if (!mem) return efault();
       u32 curval = Load32(mem);
-      if (!(curval & 0x80000000u)) return 0;  // no writer, proceed
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+      if (!(curval & 0x80000000u)) return 0;  // no writer
+      if (IsOrphan(m)) return 0;
+      usleep(1000);
+      return 0;
     }
     case 13: { // UMTX_OP_RW_WRLOCK
-      // Wait until lock state is 0 (no readers or writers)
       u8 *mem = LookupAddress(m, obj);
       if (!mem) return efault();
       u32 curval = Load32(mem);
-      if ((curval & 0x9fffffffu) == 0) return 0;  // unlocked, proceed
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, curval, 0);
+      if ((curval & 0x9fffffffu) == 0) return 0;  // no readers/writer
+      if (IsOrphan(m)) return 0;
+      usleep(1000);
+      return 0;
     }
-    case 24:  // UMTX_OP_UMUTEX_TRYLOCK
-      return 0;  // pretend lock acquired (best-effort)
-    case 7: {  // UMTX_OP_CV_WAIT
-      // obj = condvar, uaddr1 = mutex
-      // Set c_has_waiters flag (offset 4), then futex wait on c_has_waiters
-      u8 *cv_mem = LookupAddress(m, obj + 4);
-      if (!cv_mem) return efault();
-      Store32(cv_mem, 1);  // set has_waiters
-      return SysFutexWait(m, obj + 4, FUTEX_WAIT_LINUX, 1, 0);
-    }
-    case 20:  // UMTX_OP_SEM_WAIT
-    case 25:  // UMTX_OP_SEM2_WAIT
+    case 14:  // UMTX_OP_RW_UNLOCK
+      // Userspace already updated rw_state via CAS; just wake waiters
+      return SysFutexWake(m, obj, INT_MAX);
+    case 18:  // UMTX_OP_MUTEX_WAKE (deprecated)
+    case 22:  // UMTX_OP_MUTEX_WAKE2
+      return SysFutexWake(m, obj, val ? val : 1);
+    case 19:  // UMTX_OP_SEM_WAIT (deprecated)
+    case 23:  // UMTX_OP_SEM2_WAIT
       return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, 0, 0);
+    case 20:  // UMTX_OP_SEM_WAKE (deprecated)
+    case 24:  // UMTX_OP_SEM2_WAKE
+      return SysFutexWake(m, obj, val ? val : INT_MAX);
+    case 21: { // UMTX_OP_NWAKE_PRIVATE
+      // obj = pointer to array of addresses, val = count
+      // Wake one waiter at each address in the array
+      int count = val ? (int)val : 0;
+      for (int i = 0; i < count; i++) {
+        u8 *p = LookupAddress(m, obj + i * 8);
+        if (!p) continue;
+        i64 addr = Load64(p);
+        if (addr) SysFutexWake(m, addr, INT_MAX);
+      }
+      return 0;
+    }
+    case 25:  // UMTX_OP_SHM
+    case 26:  // UMTX_OP_ROBUST_LISTS
+      return 0;
     default:
       return 0;
   }
@@ -5870,6 +6030,25 @@ static int SysFreeBSDThrNew(struct Machine *m) {
 #endif
 }
 
+// FreeBSD thr_exit(long *state): exit thread, signaling TID_TERMINATED.
+// The FreeBSD kernel stores TID_TERMINATED (1) at *state via suword_lwpid
+// (a 32-bit write), then wakes futex waiters.  _pthread_join spins until
+// thread->tid == TID_TERMINATED (1).
+static _Noreturn void SysFreeBSDThrExit(struct Machine *m) {
+  i64 state_addr = Get64(m->di);
+  if (state_addr) {
+    u8 *state = LookupAddress(m, state_addr);
+    if (state) {
+      Store32(state, 1);  // TID_TERMINATED = 1 (suword_lwpid writes 32 bits)
+    }
+    SysFutexWake(m, state_addr, INT_MAX);
+  }
+  // Clear ctid so ClearChildTid() in SysExit doesn't overwrite
+  // the TID_TERMINATED value we just stored.
+  m->ctid = 0;
+  SysExit(m, 0);
+}
+
 // FreeBSD thr_wake(long id): wake a thread. Stub — return 0.
 static int SysFreeBSDThrWake(struct Machine *m, long id) {
   return 0;
@@ -5878,6 +6057,11 @@ static int SysFreeBSDThrWake(struct Machine *m, long id) {
 // FreeBSD getcontext/rtprio_thread: stub
 static int SysFreeBSDStub0(struct Machine *m) {
   return 0;
+}
+
+// FreeBSD futimens(fd, times) → utimensat(fd, NULL, times, 0)
+static int SysFreeBSDFutimens(struct Machine *m, i32 fd, i64 tvsaddr) {
+  return SysUtimensat(m, fd, 0, tvsaddr, 0);
 }
 
 // FreeBSD cpuset_getaffinity: report 1 CPU available
@@ -6316,9 +6500,11 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
                             i64 oldaddr, i64 oldlenaddr, i64 newaddr,
                             u64 newlen) {
   int rc = 0;
-  u32 name[2];
+  u32 name[6];
   if (namelen < 2) return einval();
-  if (CopyFromUserRead(m, name, nameaddr, 8) == -1) return -1;
+  u32 readlen = namelen < 6 ? namelen : 6;
+  memset(name, 0, sizeof(name));
+  if (CopyFromUserRead(m, name, nameaddr, readlen * 4) == -1) return -1;
   if (name[0] == 4 /* CTL_NET */) {
     if (name[1] == 17 /* PF_ROUTE */) {
       // NET_RT_IFLISTL / routing table from getifaddrs()
@@ -6570,6 +6756,37 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       }
       return 0;
     }
+    if (name[1] == 14 /* KERN_PROC */) {
+      // KERN_PROC: process information queries
+      // name[2] = what (KERN_PROC_PID=0, KERN_PROC_PATHNAME=12, ...)
+      // name[3] = pid or arg
+      if (namelen >= 3 && name[2] == 12 /* KERN_PROC_PATHNAME */) {
+        // Return the path of the executable for the given pid (-1 = self)
+        const char *path = m->system->elf.prog;
+        if (!path) path = "/unknown";
+        u64 len = strlen(path) + 1;
+        if (oldlenaddr) {
+          if (!oldaddr) {
+            // Size query only
+            if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+            return 0;
+          }
+        }
+        if (oldaddr) {
+          if (CopyToUserWrite(m, oldaddr, (void *)path, len) == -1) return -1;
+        }
+        if (oldlenaddr) {
+          if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+        }
+        return 0;
+      }
+      // For other KERN_PROC queries (process list, etc.), return empty
+      if (oldlenaddr) {
+        u64 len = 0;
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      }
+      return 0;
+    }
     if (name[1] == 33 /* KERN_USRSTACK */) {
       if (oldaddr) {
         u64 usrstack = 0x800000000000;
@@ -6641,7 +6858,8 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       return 0;
     }
   }
-  fprintf(stderr, "missing freebsd sysctl %d.%d\n", name[0], name[1]);
+  fprintf(stderr, "missing freebsd sysctl %d.%d.%d.%d (namelen=%d)\n",
+          name[0], name[1], name[2], name[3], namelen);
   return enosys();
 }
 
@@ -6858,9 +7076,10 @@ void OpSyscall(P) {
     fbsd_syscall = ax;
     if (ax != 232 && ax != 340) {
       SYS_LOGF("FBSDRAX %" PRIu64 " di=%#" PRIx64 " si=%#" PRIx64
-               " dx=%#" PRIx64 " r10=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64,
+               " dx=%#" PRIx64 " r10=%#" PRIx64 " r8=%#" PRIx64 " r9=%#" PRIx64
+               " ip=%#" PRIx64,
                ax, Get64(m->di), Get64(m->si), Get64(m->dx), Get64(m->r10),
-               Get64(m->r8), Get64(m->r9));
+               Get64(m->r8), Get64(m->r9), m->ip);
     }
     freebsd_translate:
     switch (ax) {
@@ -6927,11 +7146,11 @@ void OpSyscall(P) {
         ax = 0x101;
         break;  // openat
       case 490:
-        ax = 0x108;
-        break;  // renameat
+        ax = 0x10C;
+        break;  // fchmodat
       case 491:
-        ax = 0x107;
-        break;  // unlinkat
+        ax = 0x104;
+        break;  // fchownat
       case 326:
         ax = 0x4F;
         break;  // getcwd (__getcwd)
@@ -7002,6 +7221,9 @@ void OpSyscall(P) {
       case 483:
         ax = 0x71;
         break;  // shm_unlink
+      case 23:
+        ax = 0x069;
+        break;  // setuid
       case 24:
         ax = 0x66;
         break;  // getuid
@@ -7086,6 +7308,9 @@ void OpSyscall(P) {
       case 165:
         ax = 0xFE;
         break;  // sysarch
+      case 181:
+        ax = 0x06A;
+        break;  // setgid
       case 188:
       case 555:
         ax = 0x1F8;
@@ -7101,12 +7326,18 @@ void OpSyscall(P) {
       case 74:
         ax = 0x0a;
         break;  // mprotect
+      case 75:
+        ax = 0x01C;
+        break;  // madvise
       case 487:
         ax = 0x24c;
         break;  // cpuset_getaffinity
       case 194:
         ax = 0x61;
         break;  // getrlimit
+      case 195:
+        ax = 0x0A0;
+        break;  // setrlimit
       case 202:
         ax = 0x1FA;
         break;  // sysctl
@@ -7263,8 +7494,8 @@ void OpSyscall(P) {
         ax = 0x249;
         break;  // getcontext (stub)
       case 431:
-        ax = 0x3C;
-        break;  // thr_exit → exit (thread exit)
+        ax = 0x24f;
+        break;  // thr_exit (with state pointer clearing)
       case 443:
         ax = 0x248;
         break;  // thr_wake
@@ -7286,10 +7517,12 @@ void OpSyscall(P) {
       case 500:
         ax = 0x10B;
         break;  // readlinkat
-      case 496:  // mkdirat (old number)
-      case 501:
+      case 496:
         ax = 0x102;
         break;  // mkdirat
+      case 501:
+        ax = 0x108;
+        break;  // renameat
       case 57:
         ax = 0x58;
         break;  // symlink
@@ -7300,8 +7533,17 @@ void OpSyscall(P) {
         ax = 0x10A;
         break;  // symlinkat
       case 503:
-        ax = 0x109;
-        break;  // linkat
+        ax = 0x107;
+        break;  // unlinkat
+      case 546:
+        ax = 0x250;
+        break;  // futimens
+      case 547:
+        ax = 0x118;
+        break;  // utimensat
+      case 596:
+        ax = 0x074;
+        break;  // setgroups
       default:
         SYS_LOGF("unmapped FreeBSD syscall %" PRIu64, ax);
         break;
@@ -7541,6 +7783,7 @@ void OpSyscall(P) {
     SYSCALL(0, 0x24c, "cpuset_getaffinity", SysFreeBSDCpusetGetaffinity, STRACE_0);
     SYSCALL(0, 0x24d, "thr_new", SysFreeBSDThrNew, STRACE_0);
     SYSCALL(0, 0x24e, "minherit", SysFreeBSDStub0, STRACE_0);
+    SYSCALL(2, 0x250, "futimens", SysFreeBSDFutimens, STRACE_2);
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);
@@ -7553,6 +7796,9 @@ void OpSyscall(P) {
     case 0x3C:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
       SysExit(m, di);
+    case 0x24f:
+      SYS_LOGF("%s(%#" PRIx64 ")", "thr_exit", di);
+      SysFreeBSDThrExit(m);
     case 0xE7:
       SYS_LOGF("%s(%#" PRIx64 ")", "exit_group", di);
       SysExitGroup(m, di);

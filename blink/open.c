@@ -117,6 +117,7 @@ static int GetOpenFlagsBSD(int flags) {
   if (flags & 0x0200) res |= O_CREAT_LINUX;
   if (flags & 0x0400) res |= O_TRUNC_LINUX;
   if (flags & 0x0800) res |= O_EXCL_LINUX;
+  if (flags & 0x8000) res |= O_NOCTTY_LINUX;
   if (flags & 0x20000) res |= O_DIRECTORY_LINUX;
   if (flags & 0x100000) res |= O_CLOEXEC_LINUX;
   return res;
