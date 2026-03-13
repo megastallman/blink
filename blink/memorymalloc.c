@@ -912,15 +912,22 @@ i64 ReserveVirtual(struct System *s, i64 virt, i64 size, u64 flags, int fd,
         virt = ToGuest(got);
         unassert(IsValidAddrSize(virt, size));
       } else {
+        if (method == MAP_DEMAND && errno == MAP_DENIED) {
+          // requested memory overlapped blink image or system memory.
+          // instead of panicking, return ENOMEM so the guest can handle it
+          // or the program can be re-run with `blink -m`.
+          LOGF("mmap(%#" PRIx64 "[%p], %#" PRIx64 ")"
+               " overlapped blink image (try `blink -m`)",
+               virt, want, size);
+          if (got != MAP_FAILED) {
+            Munmap(got, size);
+          }
+          return enomem();
+        }
         ERRF("mmap(%#" PRIx64 "[%p], %#" PRIx64 ")"
              " -> %#" PRIx64 "[%p] crisis: %s",
              virt, want, size, ToGuest(got), got,
-             (method == MAP_DEMAND && errno == MAP_DENIED)
-                 ? "requested memory overlapped blink image or system memory. "
-                   "try using `blink -m` to disable memory optimizations, or "
-                   "try compiling blink using -Wl,--image-base=0x23000000 or "
-                   "possibly -Wl,-Ttext-segment=0x23000000 in LDFLAGS"
-                 : DescribeHostErrno(errno));
+             DescribeHostErrno(errno));
         PanicDueToMmap();
       }
     }

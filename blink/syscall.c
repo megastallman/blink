@@ -3055,8 +3055,11 @@ static int XlatFaccessatFlags(int x) {
 static int SysFaccessat2(struct Machine *m, i32 dirfd, i64 path, i32 mode,
                          i32 flags) {
   if (m->system->isfreebsd) flags = XlatFreeBSDAtFlags(flags);
-  return VfsAccess(GetDirFildes(dirfd), LoadStr(m, path), XlatAccess(mode),
-                   XlatFaccessatFlags(flags));
+  const char *p = LoadStr(m, path);
+  int xmode = XlatAccess(mode);
+  int xflags = XlatFaccessatFlags(flags);
+  int rc = VfsAccess(GetDirFildes(dirfd), p, xmode, xflags);
+  return rc;
 }
 
 static int SysFaccessat(struct Machine *m, i32 dirfd, i64 path, i32 mode) {
@@ -3348,12 +3351,8 @@ static int SysFchmod(struct Machine *m, i32 fd, u32 mode) {
   return VfsFchmod(fd, mode);
 }
 
-static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
-  int flags = 0;
-  if (m->system->isfreebsd) {
-    i32 bsdflags = (i32)Get64(m->r10);
-    flags = XlatFreeBSDAtFlags(bsdflags);
-  }
+static int SysFchmodatImpl(struct Machine *m, i32 dirfd, i64 path, u32 mode,
+                           i32 flags) {
   const char *p = LoadStr(m, path);
   if (!p) return -1;
   // On Linux, chmod on a symlink with AT_SYMLINK_NOFOLLOW is not supported.
@@ -3366,6 +3365,14 @@ static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
     }
   }
   return VfsChmod(GetDirFildes(dirfd), p, mode, flags);
+}
+
+static int SysFchmodat(struct Machine *m, i32 dirfd, i64 path, u32 mode) {
+  int flags = 0;
+  if (m->system->isfreebsd) {
+    flags = XlatFreeBSDAtFlags((i32)Get64(m->r10));
+  }
+  return SysFchmodatImpl(m, dirfd, path, mode, flags);
 }
 
 // FreeBSD struct flock layout: start(8) len(8) pid(4) type(2) whence(2) sysid(4)
@@ -3677,7 +3684,7 @@ static ssize_t SysReadlinkat(struct Machine *m, int dirfd, i64 path,
 }
 
 static int SysChmod(struct Machine *m, i64 path, u32 mode) {
-  return SysFchmodat(m, AT_FDCWD_LINUX, path, mode);
+  return SysFchmodatImpl(m, AT_FDCWD_LINUX, path, mode, 0);
 }
 
 static int SysTruncate(struct Machine *m, i64 pathaddr, i64 length) {
@@ -5654,6 +5661,10 @@ static int SysAccess(struct Machine *m, i64 path, int mode) {
   return SysFaccessat(m, AT_FDCWD_LINUX, path, mode);
 }
 
+static int SysFreeBSDEaccess(struct Machine *m, i64 path, int mode) {
+  return SysFaccessat2(m, AT_FDCWD_LINUX, path, mode, AT_EACCESS_LINUX);
+}
+
 static int SysStat(struct Machine *m, i64 path, i64 st) {
   return SysFstatat(m, AT_FDCWD_LINUX, path, st, 0);
 }
@@ -6604,6 +6615,46 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
     return enosys();
   }
   if (name[0] == 0 /* CTL_SYSCTL */) {
+    if (name[1] == 1 /* CTL_SYSCTL_NAME */) {
+      // OID-to-name: name[2..namelen-1] is the OID, return dotted name string
+      int oid0 = namelen > 2 ? name[2] : -1;
+      int oid1 = namelen > 3 ? name[3] : -1;
+      const char *sname = NULL;
+      if (oid0 == 1) {
+        switch (oid1) {
+          case 1:  sname = "kern.ostype"; break;
+          case 2:  sname = "kern.osrelease"; break;
+          case 4:  sname = "kern.version"; break;
+          case 8:  sname = "kern.argmax"; break;
+          case 10: sname = "kern.hostname"; break;
+          case 22: sname = "kern.domainname"; break;
+          case 24: sname = "kern.osreldate"; break;
+          case 33: sname = "kern.usrstack"; break;
+          case 37: sname = "kern.arnd"; break;
+          case 200: sname = "kern.boottrace.enabled"; break;
+        }
+      } else if (oid0 == 6) {
+        switch (oid1) {
+          case 1:  sname = "hw.machine"; break;
+          case 2:  sname = "hw.model"; break;
+          case 3:  sname = "hw.ncpu"; break;
+          case 12: sname = "hw.machine_arch"; break;
+          case 100: sname = "hw.pagesizes"; break;
+        }
+      } else if (oid0 == 8 && oid1 == 21) {
+        sname = "user.localbase";
+      }
+      if (!sname) {
+        fprintf(stderr, "missing freebsd sysctl name for %d.%d\n", oid0, oid1);
+        return enoent();
+      }
+      u64 slen = strlen(sname) + 1;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, sname, slen) == -1) return -1;
+      if (oldlenaddr) {
+        if (CopyToUserWrite(m, oldlenaddr, &slen, 8) == -1) return -1;
+      }
+      return 0;
+    }
     if (name[1] == 3 /* CTL_SYSCTL_NAME2OID */) {
       char buf[64];
       if (newlen >= sizeof(buf)) return einval();
@@ -6646,6 +6697,9 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       } else if (!strcmp(buf, "hw.pagesizes")) {
         oid[0] = 6;
         oid[1] = 100;
+      } else if (!strcmp(buf, "kern.boottrace.enabled")) {
+        oid[0] = 1;
+        oid[1] = 200;  // synthetic OID for boottrace.enabled
       } else {
         fprintf(stderr, "missing freebsd sysctl name2oid: %s\n", buf);
         return enoent();
@@ -6656,6 +6710,89 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
           u64 len = sizeof(oid);
           if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
         }
+      }
+      return 0;
+    }
+    if (name[1] == 4 /* CTL_SYSCTL_OIDFMT */) {
+      // Returns: u32 kind + format string for the OID in name[2..namelen-1]
+      // FreeBSD CTLTYPE: INT=2, STRING=3, UINT=6, LONG=7, ULONG=8, OPAQUE=5
+      // CTLFLAG_RD=0x80000000, CTLFLAG_WR=0x40000000, CTLFLAG_RW=both
+      u32 kind;
+      const char *fmt;
+      int oid0 = namelen > 2 ? name[2] : -1;
+      int oid1 = namelen > 3 ? name[3] : -1;
+      if (oid0 == 1 /* CTL_KERN */) {
+        switch (oid1) {
+          case 1:  /* KERN_OSTYPE */
+          case 2:  /* KERN_OSRELEASE */
+          case 4:  /* KERN_VERSION */
+          case 10: /* KERN_HOSTNAME */
+          case 22: /* KERN_DOMAINNAME */
+            kind = 0x80000003; /* CTLFLAG_RD | CTLTYPE_STRING */
+            fmt = "A";
+            break;
+          case 8:  /* KERN_ARGMAX */
+          case 24: /* KERN_OSRELDATE */
+          case 200: /* kern.boottrace.enabled (synthetic) */
+            kind = 0xC0000002; /* CTLFLAG_RW | CTLTYPE_INT */
+            fmt = "I";
+            break;
+          case 33: /* KERN_USRSTACK */
+            kind = 0x80000008; /* CTLFLAG_RD | CTLTYPE_ULONG */
+            fmt = "LU";
+            break;
+          case 37: /* KERN_ARND */
+            kind = 0x80000005; /* CTLFLAG_RD | CTLTYPE_OPAQUE */
+            fmt = "";
+            break;
+          default:
+            kind = 0x80000002; /* CTLFLAG_RD | CTLTYPE_INT */
+            fmt = "I";
+            break;
+        }
+      } else if (oid0 == 6 /* CTL_HW */) {
+        switch (oid1) {
+          case 1:  /* HW_MACHINE */
+          case 2:  /* HW_MODEL */
+          case 12: /* HW_MACHINE_ARCH */
+            kind = 0x80000003; /* CTLFLAG_RD | CTLTYPE_STRING */
+            fmt = "A";
+            break;
+          case 3:  /* HW_NCPU */
+            kind = 0x80000002; /* CTLFLAG_RD | CTLTYPE_INT */
+            fmt = "I";
+            break;
+          case 100: /* HW_PAGESIZES */
+            kind = 0x80000005; /* CTLFLAG_RD | CTLTYPE_OPAQUE */
+            fmt = "LU";
+            break;
+          default:
+            kind = 0x80000002; /* CTLFLAG_RD | CTLTYPE_INT */
+            fmt = "I";
+            break;
+        }
+      } else if (oid0 == 8 /* CTL_USER */) {
+        kind = 0x80000003; /* CTLFLAG_RD | CTLTYPE_STRING */
+        fmt = "A";
+      } else {
+        // Unknown OID - return generic int format
+        kind = 0x80000002; /* CTLFLAG_RD | CTLTYPE_INT */
+        fmt = "I";
+      }
+      if (oldaddr) {
+        u8 buf2[68];
+        u32 fmtlen = strlen(fmt) + 1;
+        if (4 + fmtlen > sizeof(buf2)) return einval();
+        memcpy(buf2, &kind, 4);
+        memcpy(buf2 + 4, fmt, fmtlen);
+        u64 total = 4 + fmtlen;
+        if (CopyToUserWrite(m, oldaddr, buf2, total) == -1) return -1;
+        if (oldlenaddr) {
+          if (CopyToUserWrite(m, oldlenaddr, &total, 8) == -1) return -1;
+        }
+      } else if (oldlenaddr) {
+        u64 total = 4 + strlen(fmt) + 1;
+        if (CopyToUserWrite(m, oldlenaddr, &total, 8) == -1) return -1;
       }
       return 0;
     }
@@ -6798,6 +6935,15 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       }
       return 0;
     }
+    if (name[1] == 200 /* synthetic: kern.boottrace.enabled */) {
+      u32 val = 0;  // boottrace not enabled under emulation
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
+      if (oldlenaddr) {
+        u64 len = 4;
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      }
+      return 0;
+    }
   } else if (name[0] == 6 /* CTL_HW */) {
     if (name[1] == 1 /* HW_MACHINE */) {
       if (oldaddr && CopyToUserWrite(m, oldaddr, "amd64", 6) == -1) return -1;
@@ -6911,6 +7057,27 @@ static int SysFreeBSDSysctlbyname(struct Machine* m, i64 nameaddr,
     }
     if (oldlenaddr) {
       u64 len = 16;
+      if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+    }
+    return 0;
+  } else if (!strcmp(buf, "kern.boottrace.enabled")) {
+    mib[0] = 1; mib[1] = 200;
+  } else if (!strcmp(buf, "security.jail.jailed")) {
+    // Return 0 (not jailed)
+    u32 val = 0;
+    if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
+    if (oldlenaddr) {
+      u64 len = 4;
+      if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+    }
+    return 0;
+  } else if (!strcmp(buf, "hw.availpages")) {
+    // Return ~4GB worth of pages (1048576 * 4096 = 4GB)
+    u64 val = 1048576;
+    if (oldaddr && CopyToUserWrite(m, oldaddr, &val, sizeof(val)) == -1)
+      return -1;
+    if (oldlenaddr) {
+      u64 len = sizeof(val);
       if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
     }
     return 0;
@@ -7544,6 +7711,9 @@ void OpSyscall(P) {
       case 596:
         ax = 0x074;
         break;  // setgroups
+      case 376:
+        ax = 0xFE0;
+        break;  // eaccess
       default:
         SYS_LOGF("unmapped FreeBSD syscall %" PRIu64, ax);
         break;
@@ -7827,6 +7997,9 @@ void OpSyscall(P) {
       break;
     case 0x206:
       ax = SysFreeBSDpdfork(m, di, si);
+      break;
+    case 0xFE0:
+      ax = SysFreeBSDEaccess(m, di, si);
       break;
     default:
     DefaultCase:
