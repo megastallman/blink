@@ -6446,6 +6446,36 @@ static int SysFreeBSDCapRightsGet(struct Machine* m, i32 fd, i64 addr) {
   return 0;
 }
 
+// Translate FreeBSD sa_flags to Linux sa_flags
+// FreeBSD: SA_ONSTACK=0x1 SA_RESTART=0x2 SA_RESETHAND=0x4 SA_NOCLDSTOP=0x8
+//          SA_NODEFER=0x10 SA_NOCLDWAIT=0x20 SA_SIGINFO=0x40
+// Linux:   SA_NOCLDSTOP=1 SA_NOCLDWAIT=2 SA_SIGINFO=4 SA_RESTORER=0x4000000
+//          SA_ONSTACK=0x8000000 SA_RESTART=0x10000000 SA_NODEFER=0x40000000
+//          SA_RESETHAND=0x80000000
+static u64 XlatFreeBSDSaFlags(u64 fbsd) {
+  u64 lnx = 0;
+  if (fbsd & 0x0001) lnx |= SA_ONSTACK_LINUX;
+  if (fbsd & 0x0002) lnx |= SA_RESTART_LINUX;
+  if (fbsd & 0x0004) lnx |= SA_RESETHAND_LINUX;
+  if (fbsd & 0x0008) lnx |= SA_NOCLDSTOP_LINUX;
+  if (fbsd & 0x0010) lnx |= SA_NODEFER_LINUX;
+  if (fbsd & 0x0020) lnx |= SA_NOCLDWAIT_LINUX;
+  if (fbsd & 0x0040) lnx |= SA_SIGINFO_LINUX;
+  return lnx;
+}
+
+static u64 XlatLinuxToFreeBSDSaFlags(u64 lnx) {
+  u64 fbsd = 0;
+  if (lnx & SA_ONSTACK_LINUX)    fbsd |= 0x0001;
+  if (lnx & SA_RESTART_LINUX)    fbsd |= 0x0002;
+  if (lnx & SA_RESETHAND_LINUX)  fbsd |= 0x0004;
+  if (lnx & SA_NOCLDSTOP_LINUX)  fbsd |= 0x0008;
+  if (lnx & SA_NODEFER_LINUX)    fbsd |= 0x0010;
+  if (lnx & SA_NOCLDWAIT_LINUX)  fbsd |= 0x0020;
+  if (lnx & SA_SIGINFO_LINUX)    fbsd |= 0x0040;
+  return fbsd;
+}
+
 static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
                                i64 oldaddr) {
   int syssig;
@@ -6461,15 +6491,18 @@ static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
     UNLOCK(&m->system->sig_lock);
     memset(fbsd_hand, 0, 32);
     Write64(fbsd_hand + 0, Read64(hand.handler));
-    Write64(fbsd_hand + 8, Read64(hand.flags));
+    // Convert Linux flags back to FreeBSD flags for the guest
+    Write64(fbsd_hand + 8, XlatLinuxToFreeBSDSaFlags(Read64(hand.flags)));
     Write64(fbsd_hand + 16, Read64(hand.mask));
     if (CopyToUserWrite(m, oldaddr, fbsd_hand, 24) == -1) return -1;
   }
   if (actaddr) {
     if (CopyFromUserRead(m, fbsd_hand, actaddr, 24) == -1) return -1;
+    u64 fbsd_flags = Read64(fbsd_hand + 8);
+    u64 linux_flags = XlatFreeBSDSaFlags(fbsd_flags);
     memset(&hand, 0, sizeof(hand));
     Write64(hand.handler, Read64(fbsd_hand + 0));
-    Write64(hand.flags, Read64(fbsd_hand + 8));
+    Write64(hand.flags, linux_flags);
     Write64(hand.mask, Read64(fbsd_hand + 16));
     LOCK(&m->system->sig_lock);
     m->system->hands[lsig - 1] = hand;
@@ -6477,10 +6510,10 @@ static int SysFreeBSDSigaction(struct Machine* m, int sig, i64 actaddr,
       struct sigaction syshand;
       sigfillset(&syshand.sa_mask);
       syshand.sa_flags = SA_SIGINFO;
-      if (Read64(hand.flags) & SA_NOCLDSTOP_LINUX)
+      if (linux_flags & SA_NOCLDSTOP_LINUX)
         syshand.sa_flags |= SA_NOCLDSTOP;
 #ifdef SA_NOCLDWAIT
-      if (Read64(hand.flags) & SA_NOCLDWAIT_LINUX)
+      if (linux_flags & SA_NOCLDWAIT_LINUX)
         syshand.sa_flags |= SA_NOCLDWAIT;
 #endif
       u64 handler = Read64(hand.handler);
