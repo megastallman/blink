@@ -374,7 +374,7 @@ static void ClearChildTid(struct Machine *m) {
 }
 
 _Noreturn void SysExitGroup(struct Machine *m, int rc) {
-  fprintf(stderr, "exit_group(%d) pid=%d\n", rc, m->system->pid);
+  /* fprintf(stderr, "exit_group(%d) pid=%d\n", rc, m->system->pid); */
   THR_LOGF("pid=%d tid=%d SysExitGroup", m->system->pid, m->tid);
   ClearChildTid(m);
   if (m->system->vfork_done_fd) {
@@ -8701,7 +8701,7 @@ void OpSyscall(P) {
 #endif /* HAVE_EPOLL_PWAIT1 */
 #endif /* DISABLE_NONPOSIX */
     case 0x3C:
-      fprintf(stderr, "exit(%d) pid=%d tid=%d\n", (int)di, m->system->pid, m->tid);
+      /* fprintf(stderr, "exit(%d) pid=%d tid=%d\n", (int)di, m->system->pid, m->tid); */
       SYS_LOGF("%s(%#" PRIx64 ")", "exit", di);
       SysExit(m, di);
     case 0x24f:

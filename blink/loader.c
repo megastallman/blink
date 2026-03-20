@@ -407,9 +407,9 @@ static bool LoadElf(struct Machine *m,  //
   bool execstack = true;
   elf->aslr = ChooseAslr(ehdr, esize, m->system->brk, &elf->base);
   m->ip = elf->at_entry = elf->aslr + Read64(ehdr->entry);
-  fprintf(stderr, "LoadElf: type=%d base=%#" PRIx64 " aslr=%#" PRIx64 " entry=%#" PRIx64 " interp=%s\n",
+  /* fprintf(stderr, "LoadElf: type=%d base=%#" PRIx64 " aslr=%#" PRIx64 " entry=%#" PRIx64 " interp=%s\n",
           Read16(ehdr->type), elf->base, elf->aslr, (u64)m->ip,
-          elf->interpreter ? "(pending)" : "(none)");
+          elf->interpreter ? "(pending)" : "(none)"); */
   m->cs.sel = USER_CS_LINUX;
   m->ss.sel = USER_DS_LINUX;
   elf->at_phdr = elf->base + Read64(ehdr->phoff);
@@ -466,7 +466,7 @@ static bool LoadElf(struct Machine *m,  //
         elf->aslr ? elf->aslr - (16 * 1024 * 1024) : FLAG_dyninterpaddr,
         &elf->at_base);
     m->ip = elf->at_base + Read64(ehdri->entry);
-    fprintf(stderr, "LoadInterp: at_base=%#" PRIx64 " ip=%#" PRIx64 "\n", elf->at_base, (u64)m->ip);
+    /* fprintf(stderr, "LoadInterp: at_base=%#" PRIx64 " ip=%#" PRIx64 "\n", elf->at_base, (u64)m->ip); */
     for (prot = i = 0; i < Read16(ehdri->phnum); ++i) {
       phdr = GetElfProgramHeaderAddress(ehdri, st.st_size, i);
       switch (Read32(phdr->type)) {
