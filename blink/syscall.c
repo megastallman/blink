@@ -4076,9 +4076,9 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
-  fprintf(stderr, "execve(%s", prog);
-  for (int i = 0; argv[i]; i++) fprintf(stderr, " %s", argv[i]);
-  fprintf(stderr, ") pid=%d\n", m->system->pid);
+  //fprintf(stderr, "execve(%s", prog);
+  //for (int i = 0; argv[i]; i++) fprintf(stderr, " %s", argv[i]);
+  //fprintf(stderr, ") pid=%d\n", m->system->pid);
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
