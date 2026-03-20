@@ -407,6 +407,9 @@ static bool LoadElf(struct Machine *m,  //
   bool execstack = true;
   elf->aslr = ChooseAslr(ehdr, esize, m->system->brk, &elf->base);
   m->ip = elf->at_entry = elf->aslr + Read64(ehdr->entry);
+  fprintf(stderr, "LoadElf: type=%d base=%#" PRIx64 " aslr=%#" PRIx64 " entry=%#" PRIx64 " interp=%s\n",
+          Read16(ehdr->type), elf->base, elf->aslr, (u64)m->ip,
+          elf->interpreter ? "(pending)" : "(none)");
   m->cs.sel = USER_CS_LINUX;
   m->ss.sel = USER_DS_LINUX;
   elf->at_phdr = elf->base + Read64(ehdr->phoff);
@@ -463,6 +466,7 @@ static bool LoadElf(struct Machine *m,  //
         elf->aslr ? elf->aslr - (16 * 1024 * 1024) : FLAG_dyninterpaddr,
         &elf->at_base);
     m->ip = elf->at_base + Read64(ehdri->entry);
+    fprintf(stderr, "LoadInterp: at_base=%#" PRIx64 " ip=%#" PRIx64 "\n", elf->at_base, (u64)m->ip);
     for (prot = i = 0; i < Read16(ehdri->phnum); ++i) {
       phdr = GetElfProgramHeaderAddress(ehdri, st.st_size, i);
       switch (Read32(phdr->type)) {
@@ -781,11 +785,7 @@ error: unsupported executable; we need:\n\
     m->flags = SetFlag(m->flags, FLAGS_IF, 1);
     m->system->cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_PG;
     m->system->cr3 = AllocatePageTable(m->system);
-    if (IsBinFile(prog)) {
-      elf->base = 0x400000;
-      LoadFlatExecutable(m, elf->base, prog, map, mapsize, fd);
-      execstack = true;
-    } else if (READ32(map) == READ32("\177ELF")) {
+    if (READ32(map) == READ32("\177ELF")) {
       if (IsFreebsdExecutable((Elf64_Ehdr_*)map, mapsize)) {
         m->system->isfreebsd = true;
       }
@@ -799,6 +799,10 @@ error: unsupported executable; we need:\n\
       if (GetElfHeader(tmp, prog, (const char *)map) == -1) exit(EXIT_FAILURE_EXEC_FAILED);
       memcpy(map, tmp, 64);
       execstack = LoadElf(m, elf, (Elf64_Ehdr_ *)map, mapsize, fd);
+    } else if (IsBinFile(prog)) {
+      elf->base = 0x400000;
+      LoadFlatExecutable(m, elf->base, prog, map, mapsize, fd);
+      execstack = true;
     } else {
       unassert(!"impossible condition");
     }
@@ -816,6 +820,24 @@ error: unsupported executable; we need:\n\
       exit(EXIT_FAILURE_EXEC_FAILED);
     }
     m->system->loaded = true;  // in case rwx stack is smc write-protected :'(
+    // FreeBSD doesn't use sa_restorer like Linux. The kernel provides a
+    // signal trampoline via PS_STRINGS. We need to provide one ourselves:
+    // a small executable page with "mov $0x1a1,%rax; syscall" (sigreturn).
+    // NOTE: Only set up for the initial process, not for child processes
+    // spawned via posix_spawn/fork+exec, because those inherit the trampoline.
+    if (0 && m->system->isfreebsd && !m->system->sigtramp) {
+      i64 tramp = 0x7fff0000;
+      tramp = ReserveVirtual(m->system, tramp, 4096,
+                             PAGE_FILE | PAGE_U | PAGE_RW, -1, 0, 0, 0);
+      if (tramp != -1) {
+        // mov $0x1a1,%rax (FreeBSD sigreturn=417); syscall
+        static const u8 code[] = {0x48, 0xc7, 0xc0, 0xa1, 0x01, 0x00, 0x00,
+                                  0x0f, 0x05};
+        u8 *p = LookupAddress(m, tramp);
+        if (p) memcpy(p, code, sizeof(code));
+        m->system->sigtramp = tramp;
+      }
+    }
     LoadArgv(m, execfn, prog, args, vars, elf->rng);
   }
   pagesize = FLAG_pagesize;

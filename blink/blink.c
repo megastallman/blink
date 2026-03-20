@@ -151,6 +151,7 @@ static void PrintDiagnostics(struct Machine *m) {
 void TerminateSignal(struct Machine *m, int sig, int code) {
   int syssig;
   struct sigaction sa;
+  fprintf(stderr, "TerminateSignal(%d) pid=%d rip=%#" PRIx64 "\n", sig, m->system->pid, m->ip);
   unassert(!IsSignalIgnoredByDefault(sig));
   KillOtherThreads(m->system);
 #ifdef HAVE_JIT
@@ -191,6 +192,13 @@ static void OnFatalSystemSignal(int sig, siginfo_t *si, void *ptr) {
 #ifndef DISABLE_JIT
   if (IsSelfModifyingCodeSegfault(m, si)) return;
 #endif
+  fprintf(stderr, "FATAL SIG%d pid=%d addr=%p m=%p canhalt=%d rip=%#" PRIx64 "\n",
+          sig, getpid(), si->si_addr, (void*)m, m ? m->canhalt : -1,
+          m ? m->ip : 0);
+  if (m) {
+    m->faultaddr = (i64)(intptr_t)si->si_addr;
+    PrintDiagnostics(m);
+  }
   g_siginfo = *si;
   unassert(m);
   unassert(m->canhalt);

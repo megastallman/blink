@@ -1256,6 +1256,18 @@ struct msghdr_linux {
   u8 pad2_[4];       //
 };
 
+struct msghdr_freebsd {
+  u8 name[8];        // 0: void *msg_name
+  u8 namelen[4];     // 8: socklen_t msg_namelen
+  u8 pad1_[4];       // 12
+  u8 iov[8];         // 16: struct iovec *msg_iov
+  u8 iovlen[4];      // 24: int msg_iovlen
+  u8 pad2_[4];       // 28
+  u8 control[8];     // 32: void *msg_control
+  u8 controllen[4];  // 40: socklen_t msg_controllen
+  u8 flags[4];       // 44: int msg_flags
+};                    // total: 48
+
 struct mmsghdr_linux {
   struct msghdr_linux hdr;
   u8 len[4];

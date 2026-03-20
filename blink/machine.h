@@ -273,6 +273,7 @@ struct System {
   bool emulate_root;
   bool trapexit;
   i64 thr_exit_thunk;
+  i64 sigtramp;
   int vfork_done_fd;
   bool brkchanged;
   _Atomic(bool) killer;

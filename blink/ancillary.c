@@ -97,6 +97,20 @@ static int SendScmCredentials(struct Machine *m, struct msghdr *msg,
            ucred.gid);
   return AppendCmsg(m, msg, SOL_SOCKET, SCM_CREDENTIALS, &ucred, sizeof(ucred));
 }
+
+// FreeBSD struct cmsgcred: [pid:4][uid:4][euid:4][gid:4][ngroups:2][pad:2][groups[16]:64]
+// Convert to Linux struct ucred: [pid:4][uid:4][gid:4]
+static int SendFreeBSDScmCreds(struct Machine *m, struct msghdr *msg,
+                               const u8 *payload, size_t elements) {
+  struct ucred ucred;
+  if (elements != 1) return einval();
+  ucred.pid = Read32(payload + 0);   // cmcred_pid
+  ucred.uid = Read32(payload + 8);   // cmcred_euid (use effective uid)
+  ucred.gid = Read32(payload + 12);  // cmcred_gid
+  SYS_LOGF("SendFreeBSDScmCreds(pid=%d, uid=%d, gid=%d)", ucred.pid, ucred.uid,
+           ucred.gid);
+  return AppendCmsg(m, msg, SOL_SOCKET, SCM_CREDENTIALS, &ucred, sizeof(ucred));
+}
 #endif
 
 #ifdef SCM_RIGHTS
@@ -134,7 +148,13 @@ static void ReadCmsgLevelType(const struct cmsghdr_linux *gcmsg, u32 *level,
   }
 }
 
-static ssize_t GetAncillaryElementLength(const struct cmsghdr_linux *gcmsg) {
+// FreeBSD SCM_CREDS = 3, struct cmsgcred = 84 bytes
+// [pid:4][uid:4][euid:4][gid:4][ngroups:2][pad:2][groups[16]:64]
+#define SCM_CREDS_FREEBSD       3
+#define SIZEOF_CMSGCRED_FREEBSD 84
+
+static ssize_t GetAncillaryElementLength(const struct cmsghdr_linux *gcmsg,
+                                         bool isfreebsd) {
   u32 level, type;
   ReadCmsgLevelType(gcmsg, &level, &type);
   switch (level) {
@@ -148,6 +168,9 @@ static ssize_t GetAncillaryElementLength(const struct cmsghdr_linux *gcmsg) {
 #ifndef DISABLE_NONPOSIX
         case SCM_CREDENTIALS_LINUX:
           return sizeof(struct ucred_linux);
+        case SCM_CREDS_FREEBSD:
+          if (isfreebsd) return SIZEOF_CMSGCRED_FREEBSD;
+          break;
 #endif
 #endif
         default:
@@ -191,7 +214,7 @@ int SendAncillary(struct Machine *m, struct msghdr *msg,
            Read32(gcmsg->level), Read32(gcmsg->type), avail, (unsigned)need);
       return einval();
     }
-    if ((rc = GetAncillaryElementLength(gcmsg)) == -1) {
+    if ((rc = GetAncillaryElementLength(gcmsg, m->system->isfreebsd)) == -1) {
       return -1;
     }
     if (len) {
@@ -228,6 +251,11 @@ int SendAncillary(struct Machine *m, struct msghdr *msg,
           case SCM_CREDENTIALS_LINUX:
             if (SendScmCredentials(m, msg, (const struct ucred_linux *)payload,
                                    elements) == -1)
+              return -1;
+            break;
+          case SCM_CREDS_FREEBSD:
+            if (SendFreeBSDScmCreds(m, msg, (const u8 *)payload,
+                                    elements) == -1)
               return -1;
             break;
 #endif
