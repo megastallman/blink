@@ -988,9 +988,60 @@ struct stat_linux {
   struct timespec_linux ctim;
 };
 
+struct statx_timestamp_linux {
+  u8 sec[8];      // i64
+  u8 nsec[4];     // u32
+  u8 reserved[4]; // i32
+};
+
+#define STATX_TYPE_LINUX        0x0001
+#define STATX_MODE_LINUX        0x0002
+#define STATX_NLINK_LINUX       0x0004
+#define STATX_UID_LINUX         0x0008
+#define STATX_GID_LINUX         0x0010
+#define STATX_ATIME_LINUX       0x0020
+#define STATX_MTIME_LINUX       0x0040
+#define STATX_CTIME_LINUX       0x0080
+#define STATX_INO_LINUX         0x0100
+#define STATX_SIZE_LINUX        0x0200
+#define STATX_BLOCKS_LINUX      0x0400
+#define STATX_BASIC_STATS_LINUX 0x07ff
+
+struct statx_linux {
+  u8 mask[4];
+  u8 blksize[4];
+  u8 attributes[8];
+  u8 nlink[4];
+  u8 uid[4];
+  u8 gid[4];
+  u8 mode[2];
+  u8 spare0[2];
+  u8 ino[8];
+  u8 size[8];
+  u8 blocks[8];
+  u8 attributes_mask[8];
+  struct statx_timestamp_linux atime;
+  struct statx_timestamp_linux btime;
+  struct statx_timestamp_linux ctime;
+  struct statx_timestamp_linux mtime;
+  u8 rdev_major[4];
+  u8 rdev_minor[4];
+  u8 dev_major[4];
+  u8 dev_minor[4];
+  u8 mnt_id[8];
+  u8 dio_mem_align[4];
+  u8 dio_offset_align[4];
+  u8 spare3[12 * 8];
+};
+
 struct itimerval_linux {
   struct timeval_linux interval;
   struct timeval_linux value;
+};
+
+struct itimerspec_linux {
+  struct timespec_linux interval;
+  struct timespec_linux value;
 };
 
 struct rusage_linux {

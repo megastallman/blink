@@ -112,6 +112,13 @@
 #include <sys/mount.h>
 #endif
 
+#ifdef __linux__
+#include <sys/inotify.h>
+#include <sys/signalfd.h>
+#include <sys/syscall.h>
+#include <sys/timerfd.h>
+#endif
+
 #ifdef SO_LINGER_SEC
 #define SO_LINGER_ SO_LINGER_SEC
 #else
@@ -3101,7 +3108,33 @@ static int SysSetTidAddress(struct Machine *m, i64 ctid) {
 
 static int SysFadvise(struct Machine *m, u32 fd, u64 offset, u64 len,
                       i32 advice) {
+#ifdef __linux__
+  // POSIX_FADV_* constants 0..5 are identical on Linux and FreeBSD.
+  // posix_fadvise(3) returns the errno as a positive value rather than
+  // setting errno; convert to syscall convention.
+  int rc = posix_fadvise((int)fd, (off_t)offset, (off_t)len, advice);
+  if (rc != 0) {
+    errno = rc;
+    return -1;
+  }
   return 0;
+#else
+  (void)m; (void)fd; (void)offset; (void)len; (void)advice;
+  return 0;
+#endif
+}
+
+static int SysFallocate(struct Machine *m, i32 fd, i32 mode, i64 offset,
+                        i64 len) {
+#ifdef __linux__
+  int rc;
+  (void)m;
+  RESTARTABLE(rc = fallocate(fd, mode, (off_t)offset, (off_t)len));
+  return rc;
+#else
+  (void)m; (void)fd; (void)mode; (void)offset; (void)len;
+  return enosys();
+#endif
 }
 
 static i64 SysLseek(struct Machine *m, i32 fildes, i64 offset, int whence) {
@@ -5906,6 +5939,856 @@ static i32 SysEventfd2(struct Machine *m, u32 initval, i32 flags) {
   return fildes;
 }
 
+static i32 SysMemfdCreate(struct Machine *m, i64 nameaddr, u32 flags) {
+#ifdef __linux__
+  int lim, fildes, oflags;
+  const char *name;
+  if (!(name = LoadStr(m, nameaddr))) return -1;
+  oflags = O_RDWR;
+  if (flags & 0x0001) oflags |= O_CLOEXEC;  // MFD_CLOEXEC_LINUX
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  if ((fildes = memfd_create(name, flags)) != -1) {
+    if (fildes >= lim) {
+      close(fildes);
+      fildes = emfile();
+    } else {
+      LOCK(&m->system->fds.lock);
+      unassert(AddFd(&m->system->fds, fildes, oflags));
+      UNLOCK(&m->system->fds.lock);
+    }
+  }
+  return fildes;
+#else
+  return enosys();
+#endif
+}
+
+static int SysStatxImpl(struct Machine *m, i32 dirfd, const char *path,
+                        i32 flags, u32 mask, i64 staddr) {
+  int rc, sysflags;
+  struct stat st;
+  struct statx_linux gst;
+  (void)mask;
+  sysflags = 0;
+  if (flags & AT_SYMLINK_NOFOLLOW_LINUX) {
+    sysflags |= AT_SYMLINK_NOFOLLOW;
+    flags &= ~AT_SYMLINK_NOFOLLOW_LINUX;
+  }
+#ifndef DISABLE_NONPOSIX
+  if (flags & AT_EMPTY_PATH_LINUX) {
+    flags &= ~AT_EMPTY_PATH_LINUX;
+    if (path && !*path) {
+      if ((rc = VfsFstat(dirfd, &st)) == -1) return -1;
+      goto have_stat;
+    }
+  }
+#endif
+  if (flags & AT_NO_AUTOMOUNT_LINUX) flags &= ~AT_NO_AUTOMOUNT_LINUX;
+  flags &= ~0x6000;  // AT_STATX_SYNC_TYPE bits — we ignore sync hints
+  if (flags) {
+    LOGF("%s() flags %d not supported", "statx", flags);
+    return einval();
+  }
+  if ((rc = VfsStat(GetDirFildes(dirfd), path, &st, sysflags)) == -1) return -1;
+have_stat:
+  memset(&gst, 0, sizeof(gst));
+  Write32(gst.mask, STATX_BASIC_STATS_LINUX);
+  Write32(gst.blksize, st.st_blksize);
+  Write32(gst.nlink, st.st_nlink);
+  Write32(gst.uid, st.st_uid);
+  Write32(gst.gid, st.st_gid);
+  Write16(gst.mode, st.st_mode);
+  Write64(gst.ino, st.st_ino);
+  Write64(gst.size, st.st_size);
+  Write64(gst.blocks, st.st_blocks);
+  Write64(gst.atime.sec, st.st_atim.tv_sec);
+  Write32(gst.atime.nsec, st.st_atim.tv_nsec);
+  Write64(gst.mtime.sec, st.st_mtim.tv_sec);
+  Write32(gst.mtime.nsec, st.st_mtim.tv_nsec);
+  Write64(gst.ctime.sec, st.st_ctim.tv_sec);
+  Write32(gst.ctime.nsec, st.st_ctim.tv_nsec);
+  Write32(gst.rdev_major, (u32)((st.st_rdev >> 8) & 0xfff) |
+                              ((u32)(st.st_rdev >> 32) & ~0xfffu));
+  Write32(gst.rdev_minor, (u32)(st.st_rdev & 0xff) |
+                              ((u32)(st.st_rdev >> 12) & ~0xffu));
+  Write32(gst.dev_major, (u32)((st.st_dev >> 8) & 0xfff) |
+                             ((u32)(st.st_dev >> 32) & ~0xfffu));
+  Write32(gst.dev_minor, (u32)(st.st_dev & 0xff) |
+                             ((u32)(st.st_dev >> 12) & ~0xffu));
+  if (CopyToUserWrite(m, staddr, &gst, sizeof(gst)) == -1) return -1;
+  return 0;
+}
+
+static int SysStatx(struct Machine *m, i32 dirfd, i64 pathaddr, i32 flags,
+                    u32 mask, i64 staddr) {
+  const char *path;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  return SysStatxImpl(m, dirfd, path, flags, mask, staddr);
+}
+
+#ifdef __linux__
+static int FinishHostFd(struct Machine *m, int hostfd, int oflags) {
+  int lim;
+  if (hostfd == -1) return -1;
+  if (!(lim = GetFileDescriptorLimit(m->system))) {
+    close(hostfd);
+    return emfile();
+  }
+  if (hostfd >= lim) {
+    close(hostfd);
+    return emfile();
+  }
+  LOCK(&m->system->fds.lock);
+  unassert(AddFd(&m->system->fds, hostfd, oflags));
+  UNLOCK(&m->system->fds.lock);
+  return hostfd;
+}
+#endif
+
+static i32 SysSignalfd4(struct Machine *m, i32 fd, i64 maskaddr, i64 sizemask,
+                        i32 flags) {
+#ifdef __linux__
+  sigset_t mask;
+  u8 buf[8];
+  int sysflags = 0, oflags = O_RDWR;
+  if ((size_t)sizemask > sizeof(buf)) sizemask = sizeof(buf);
+  if (CopyFromUserRead(m, buf, maskaddr, sizemask) == -1) return -1;
+  sigemptyset(&mask);
+  {
+    u64 m64 = 0;
+    for (int i = 0; i < (int)sizemask && i < 8; i++) m64 |= ((u64)buf[i]) << (i * 8);
+    for (int sig = 1; sig < 64; sig++) {
+      if (m64 & ((u64)1 << (sig - 1))) sigaddset(&mask, sig);
+    }
+  }
+  if (flags & O_NDELAY_LINUX) {
+    sysflags |= SFD_NONBLOCK;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_NDELAY_LINUX;
+  }
+  if (flags & O_CLOEXEC_LINUX) {
+    sysflags |= SFD_CLOEXEC;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_CLOEXEC_LINUX;
+  }
+  if (flags) {
+    LOGF("unsupported %s flags: %#x", "signalfd4", flags);
+    return einval();
+  }
+  if (fd != -1) {
+    int hfd = GetDirFildes(fd);  // resolves guest fd → host fd
+    return signalfd(hfd, &mask, sysflags);
+  }
+  return FinishHostFd(m, signalfd(-1, &mask, sysflags), oflags);
+#else
+  return enosys();
+#endif
+}
+
+static int XlatLinuxClockToHost(int clk) {
+  switch (clk) {
+    case 0: return CLOCK_REALTIME;
+    case 1: return CLOCK_MONOTONIC;
+#ifdef CLOCK_BOOTTIME
+    case 7: return CLOCK_BOOTTIME;
+#endif
+#ifdef CLOCK_REALTIME_ALARM
+    case 8: return CLOCK_REALTIME_ALARM;
+#endif
+#ifdef CLOCK_BOOTTIME_ALARM
+    case 9: return CLOCK_BOOTTIME_ALARM;
+#endif
+    default: return -1;
+  }
+}
+
+static i32 SysTimerfdCreate(struct Machine *m, i32 clockid, i32 flags) {
+#ifdef __linux__
+  int sysflags = 0, oflags = O_RDWR, hclk;
+  if ((hclk = XlatLinuxClockToHost(clockid)) == -1) return einval();
+  if (flags & O_NDELAY_LINUX) {
+    sysflags |= TFD_NONBLOCK;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_NDELAY_LINUX;
+  }
+  if (flags & O_CLOEXEC_LINUX) {
+    sysflags |= TFD_CLOEXEC;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_CLOEXEC_LINUX;
+  }
+  if (flags) {
+    LOGF("unsupported %s flags: %#x", "timerfd_create", flags);
+    return einval();
+  }
+  return FinishHostFd(m, timerfd_create(hclk, sysflags), oflags);
+#else
+  return enosys();
+#endif
+}
+
+#ifdef __linux__
+static void XlatItimerspecFromLinux(struct itimerspec *dst,
+                                    const struct itimerspec_linux *src) {
+  dst->it_interval.tv_sec = Read64(src->interval.sec);
+  dst->it_interval.tv_nsec = Read64(src->interval.nsec);
+  dst->it_value.tv_sec = Read64(src->value.sec);
+  dst->it_value.tv_nsec = Read64(src->value.nsec);
+}
+
+static void XlatItimerspecToLinux(struct itimerspec_linux *dst,
+                                  const struct itimerspec *src) {
+  Write64(dst->interval.sec, src->it_interval.tv_sec);
+  Write64(dst->interval.nsec, src->it_interval.tv_nsec);
+  Write64(dst->value.sec, src->it_value.tv_sec);
+  Write64(dst->value.nsec, src->it_value.tv_nsec);
+}
+#endif
+
+static i32 SysTimerfdSettime(struct Machine *m, i32 fd, i32 flags,
+                             i64 newaddr, i64 oldaddr) {
+#ifdef __linux__
+  int sysflags = 0, rc;
+  struct itimerspec_linux gnew, gold;
+  struct itimerspec snew, sold;
+  if (flags & 1) sysflags |= TFD_TIMER_ABSTIME;
+  flags &= ~1;
+  if (flags) return einval();
+  if (CopyFromUserRead(m, &gnew, newaddr, sizeof(gnew)) == -1) return -1;
+  XlatItimerspecFromLinux(&snew, &gnew);
+  if ((rc = timerfd_settime(fd, sysflags, &snew, oldaddr ? &sold : 0)) == -1) {
+    return -1;
+  }
+  if (oldaddr) {
+    XlatItimerspecToLinux(&gold, &sold);
+    if (CopyToUserWrite(m, oldaddr, &gold, sizeof(gold)) == -1) return -1;
+  }
+  return rc;
+#else
+  return enosys();
+#endif
+}
+
+static i32 SysTimerfdGettime(struct Machine *m, i32 fd, i64 curraddr) {
+#ifdef __linux__
+  int rc;
+  struct itimerspec_linux gcur;
+  struct itimerspec scur;
+  if ((rc = timerfd_gettime(fd, &scur)) == -1) return -1;
+  XlatItimerspecToLinux(&gcur, &scur);
+  if (CopyToUserWrite(m, curraddr, &gcur, sizeof(gcur)) == -1) return -1;
+  return rc;
+#else
+  return enosys();
+#endif
+}
+
+static i32 SysInotifyInit1(struct Machine *m, i32 flags) {
+#ifdef __linux__
+  int sysflags = 0, oflags = O_RDWR;
+  if (flags & O_NDELAY_LINUX) {
+    sysflags |= IN_NONBLOCK;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_NDELAY_LINUX;
+  }
+  if (flags & O_CLOEXEC_LINUX) {
+    sysflags |= IN_CLOEXEC;
+    oflags |= O_CLOEXEC;
+    flags &= ~O_CLOEXEC_LINUX;
+  }
+  if (flags) {
+    LOGF("unsupported %s flags: %#x", "inotify_init1", flags);
+    return einval();
+  }
+  return FinishHostFd(m, inotify_init1(sysflags), oflags);
+#else
+  return enosys();
+#endif
+}
+
+static i32 SysInotifyInit(struct Machine *m) {
+  return SysInotifyInit1(m, 0);
+}
+
+static i32 SysInotifyAddWatch(struct Machine *m, i32 fd, i64 pathaddr,
+                              u32 mask) {
+#ifdef __linux__
+  const char *path;
+  if (!(path = LoadStr(m, pathaddr))) return -1;
+  return inotify_add_watch(fd, path, mask);
+#else
+  return enosys();
+#endif
+}
+
+static i32 SysInotifyRmWatch(struct Machine *m, i32 fd, i32 wd) {
+#ifdef __linux__
+  return inotify_rm_watch(fd, wd);
+#else
+  return enosys();
+#endif
+}
+
+static i32 SysEventfd(struct Machine *m, u32 initval) {
+  return SysEventfd2(m, initval, 0);
+}
+
+static i32 SysSignalfd(struct Machine *m, i32 fd, i64 maskaddr, i64 sizemask) {
+  return SysSignalfd4(m, fd, maskaddr, sizemask, 0);
+}
+
+// Linux waitid idtype constants
+#define P_ALL_LINUX  0
+#define P_PID_LINUX  1
+#define P_PGID_LINUX 2
+// Linux WEXITED/WSTOPPED/WCONTINUED already defined; waitid needs them as
+// the "which states to report" mask (in addition to WNOHANG/WNOWAIT).
+#define WSTOPPED_LINUX WUNTRACED_LINUX
+
+static int XlatWaitidOptions(int x, int *out) {
+  int r = 0;
+  if (x & WNOHANG_LINUX) {
+    r |= WNOHANG;
+    x &= ~WNOHANG_LINUX;
+  }
+  if (x & WUNTRACED_LINUX) {  // == WSTOPPED
+    r |= WUNTRACED;
+    x &= ~WUNTRACED_LINUX;
+  }
+  if (x & WEXITED_LINUX) {
+    x &= ~WEXITED_LINUX;  // always reported by host waitid
+  }
+#ifdef WCONTINUED
+  if (x & WCONTINUED_LINUX) {
+    r |= WCONTINUED;
+    x &= ~WCONTINUED_LINUX;
+  }
+#endif
+#ifdef WNOWAIT
+  if (x & WNOWAIT_LINUX) {
+    r |= WNOWAIT;
+    x &= ~WNOWAIT_LINUX;
+  }
+#endif
+  if (x) {
+    LOGF("%s %d not supported yet", "waitid", x);
+    return einval();
+  }
+  *out = r;
+  return 0;
+}
+
+static int XlatWaitidType(int idtype, idtype_t *out) {
+  switch (idtype) {
+    case P_ALL_LINUX:  *out = P_ALL;  return 0;
+    case P_PID_LINUX:  *out = P_PID;  return 0;
+    case P_PGID_LINUX: *out = P_PGID; return 0;
+    default:
+      LOGF("waitid idtype %d not supported", idtype);
+      return einval();
+  }
+}
+
+static int SysWaitid(struct Machine *m, i32 idtype, i32 id, i64 infoaddr,
+                     i32 options, i64 rusageaddr) {
+  int rc, sysopts;
+  idtype_t sysidtype;
+  siginfo_t info;
+  struct siginfo_linux gsi;
+  struct rusage hrusage;
+  struct rusage_linux grusage;
+  if (XlatWaitidType(idtype, &sysidtype) == -1) return -1;
+  if (XlatWaitidOptions(options, &sysopts) == -1) return -1;
+  memset(&info, 0, sizeof(info));
+  if (rusageaddr) memset(&hrusage, 0, sizeof(hrusage));
+#ifdef __linux__
+  // Linux's waitid() exposes a 5-arg variant taking rusage*; libc doesn't.
+  RESTARTABLE(rc = syscall(SYS_waitid, sysidtype, id, &info, sysopts,
+                           rusageaddr ? &hrusage : NULL));
+#else
+  RESTARTABLE(rc = waitid(sysidtype, id, &info, sysopts));
+  if (rc != -1 && rusageaddr && info.si_pid > 0) {
+    getrusage(info.si_pid, &hrusage);
+  }
+#endif
+  if (rc == -1) return -1;
+  memset(&gsi, 0, sizeof(gsi));
+  // info.si_signo is 0 if WNOHANG and no child changed state
+  if (info.si_signo) {
+    Write32(gsi.signo, UnXlatSignal(info.si_signo));
+    Write32(gsi.errno_, 0);
+    {
+      int code;
+      switch (info.si_code) {
+        case CLD_EXITED:    code = CLD_EXITED_LINUX; break;
+        case CLD_KILLED:    code = CLD_KILLED_LINUX; break;
+        case CLD_DUMPED:    code = CLD_DUMPED_LINUX; break;
+        case CLD_TRAPPED:   code = CLD_TRAPPED_LINUX; break;
+        case CLD_STOPPED:   code = CLD_STOPPED_LINUX; break;
+        case CLD_CONTINUED: code = CLD_CONTINUED_LINUX; break;
+        default:            code = info.si_code; break;
+      }
+      Write32(gsi.code, code);
+    }
+    Write32(gsi.pid, info.si_pid);
+    Write32(gsi.uid, info.si_uid);
+    // For CLD_EXITED, status is the exit code; otherwise it's the signal.
+    if (info.si_code == CLD_EXITED) {
+      Write32(gsi.status, info.si_status);
+    } else {
+      Write32(gsi.status, UnXlatSignal(info.si_status));
+    }
+  }
+  if (CopyToUserWrite(m, infoaddr, &gsi, sizeof(gsi)) == -1) return -1;
+  if (rusageaddr) {
+    XlatRusageToLinux(&grusage, &hrusage);
+    if (CopyToUserWrite(m, rusageaddr, &grusage, sizeof(grusage)) == -1) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static i32 SysMlock(struct Machine *m, i64 addr, u64 len) {
+  (void)m; (void)addr; (void)len;
+  return 0;
+}
+
+static i32 SysMlock2(struct Machine *m, i64 addr, u64 len, u32 flags) {
+  (void)m; (void)addr; (void)len; (void)flags;
+  return 0;
+}
+
+static i32 SysMunlock(struct Machine *m, i64 addr, u64 len) {
+  (void)m; (void)addr; (void)len;
+  return 0;
+}
+
+static i32 SysMlockall(struct Machine *m, i32 flags) {
+  (void)m; (void)flags;
+  return 0;
+}
+
+static i32 SysMunlockall(struct Machine *m) {
+  (void)m;
+  return 0;
+}
+
+// struct open_how (Linux uapi). Total 24 bytes.
+struct open_how_linux {
+  u8 flags[8];
+  u8 mode[8];
+  u8 resolve[8];
+};
+
+static i32 SysOpenat2(struct Machine *m, i32 dirfd, i64 pathaddr, i64 howaddr,
+                      u64 usize) {
+  struct open_how_linux how;
+  u64 flags, mode, resolve;
+  // Linux: usize too small → EINVAL; too big → E2BIG (we use EINVAL too).
+  if (usize < sizeof(how)) return einval();
+  if (usize > 4096) return einval();
+  memset(&how, 0, sizeof(how));
+  if (CopyFromUserRead(m, &how, howaddr, sizeof(how)) == -1) return -1;
+  // Linux: trailing bytes beyond sizeof(how) must be zero — we don't validate
+  // them (assumes caller is well-behaved; the basic-stats path covers all
+  // common modern callers that probe with usize=24).
+  flags = Read64(how.flags);
+  mode = Read64(how.mode);
+  resolve = Read64(how.resolve);
+  // mode must be zero unless O_CREAT/O_TMPFILE is in flags.
+  if (mode && !(flags & (O_CREAT_LINUX | __O_TMPFILE_LINUX))) return einval();
+  // RESOLVE_* — we don't currently honor any of these. Most callers probe
+  // with resolve=0, so refuse any non-zero value to make them fall back to
+  // openat. (RESOLVE_NO_SYMLINKS could be approximated with O_NOFOLLOW, but
+  // its semantics differ on intermediate components — be conservative.)
+  if (resolve) {
+    LOGF("openat2 resolve=%#" PRIx64 " not supported", resolve);
+    return einval();
+  }
+  return SysOpenat(m, dirfd, pathaddr, (i32)flags, (i32)mode);
+}
+
+// struct clone_args (Linux uapi). The three documented sizes are
+// CLONE_ARGS_SIZE_VER0=64, VER1=80, VER2=88. We honor up to VER2 and refuse
+// non-zero fields beyond what we can implement.
+struct clone_args_linux {
+  u8 flags[8];        // off 0
+  u8 pidfd[8];        // off 8
+  u8 child_tid[8];    // off 16
+  u8 parent_tid[8];   // off 24
+  u8 exit_signal[8];  // off 32
+  u8 stack[8];        // off 40
+  u8 stack_size[8];   // off 48
+  u8 tls[8];          // off 56  -- end of VER0
+  u8 set_tid[8];      // off 64
+  u8 set_tid_size[8]; // off 72  -- end of VER1
+  u8 cgroup[8];       // off 80  -- end of VER2
+};
+
+static i32 SysClone3(struct Machine *m, i64 argsaddr, u64 size) {
+  struct clone_args_linux args;
+  u64 flags, stack, stack_size, parent_tid, child_tid, tls, exit_signal;
+  u64 pidfd_ptr, set_tid, set_tid_size, cgroup;
+  if (size < 64) return einval();
+  if (size > sizeof(args)) {
+    // Unknown trailing fields — refuse rather than silently ignore.
+    LOGF("clone3 size=%" PRIu64 " exceeds supported", size);
+    return einval();
+  }
+  memset(&args, 0, sizeof(args));
+  if (CopyFromUserRead(m, &args, argsaddr, size) == -1) return -1;
+  flags = Read64(args.flags);
+  pidfd_ptr = Read64(args.pidfd);
+  child_tid = Read64(args.child_tid);
+  parent_tid = Read64(args.parent_tid);
+  exit_signal = Read64(args.exit_signal);
+  stack = Read64(args.stack);
+  stack_size = Read64(args.stack_size);
+  tls = Read64(args.tls);
+  set_tid = (size >= 72) ? Read64(args.set_tid) : 0;
+  set_tid_size = (size >= 80) ? Read64(args.set_tid_size) : 0;
+  cgroup = (size >= 88) ? Read64(args.cgroup) : 0;
+  if (set_tid || set_tid_size) {
+    LOGF("clone3 set_tid not supported");
+    return einval();
+  }
+  if (cgroup) {
+    LOGF("clone3 CLONE_INTO_CGROUP not supported");
+    return einval();
+  }
+  if (pidfd_ptr && !(flags & 0x00001000)) {  // CLONE_PIDFD = 0x1000
+    // pidfd ptr without CLONE_PIDFD is invalid per kernel.
+    return einval();
+  }
+  if (pidfd_ptr) {
+    LOGF("clone3 CLONE_PIDFD not supported");
+    return einval();
+  }
+  // Compose into the legacy clone() ABI:
+  //   flags = clone_flags | (exit_signal & 0xff)
+  //   stack = top of stack (start of region + size, since the kernel grows down)
+  // For fork-style (stack == 0), pass 0 through unchanged.
+  flags |= (exit_signal & 0xff);
+  if (stack) stack += stack_size;
+  return SysClone(m, flags, stack, parent_tid, child_tid, tls, 0);
+}
+
+// Linux SPLICE_F_* flag values are stable across architectures and match the
+// host on Linux, so no translation needed. We pass them through and let the
+// host kernel reject anything unknown. On non-Linux hosts we return ENOSYS.
+#define SPLICE_F_ALL_LINUX 0x0f  // MOVE|NONBLOCK|MORE|GIFT
+
+static i64 SysSplice(struct Machine *m, i32 fd_in, i64 off_in_addr, i32 fd_out,
+                     i64 off_out_addr, u64 len, u32 flags) {
+#ifdef __linux__
+  i64 rc;
+  u8 *off_in_p = 0, *off_out_p = 0;
+  loff_t off_in_v, off_out_v;
+  loff_t *off_in = 0, *off_out = 0;
+  if (flags & ~SPLICE_F_ALL_LINUX) {
+    LOGF("splice flags %#x not supported", flags);
+    return einval();
+  }
+  if (off_in_addr) {
+    if (!(off_in_p = (u8 *)SchlepRW(m, off_in_addr, 8))) return -1;
+    off_in_v = (loff_t)Read64(off_in_p);
+    off_in = &off_in_v;
+  }
+  if (off_out_addr) {
+    if (!(off_out_p = (u8 *)SchlepRW(m, off_out_addr, 8))) return -1;
+    off_out_v = (loff_t)Read64(off_out_p);
+    off_out = &off_out_v;
+  }
+  RESTARTABLE(rc = splice(fd_in, off_in, fd_out, off_out, (size_t)len, flags));
+  if (rc != -1) {
+    if (off_in_p) Write64(off_in_p, (u64)off_in_v);
+    if (off_out_p) Write64(off_out_p, (u64)off_out_v);
+  }
+  return rc;
+#else
+  (void)m; (void)fd_in; (void)off_in_addr; (void)fd_out; (void)off_out_addr;
+  (void)len; (void)flags;
+  return enosys();
+#endif
+}
+
+static i64 SysTee(struct Machine *m, i32 fd_in, i32 fd_out, u64 len,
+                  u32 flags) {
+#ifdef __linux__
+  i64 rc;
+  (void)m;
+  if (flags & ~SPLICE_F_ALL_LINUX) {
+    LOGF("tee flags %#x not supported", flags);
+    return einval();
+  }
+  RESTARTABLE(rc = tee(fd_in, fd_out, (size_t)len, flags));
+  return rc;
+#else
+  (void)m; (void)fd_in; (void)fd_out; (void)len; (void)flags;
+  return enosys();
+#endif
+}
+
+static i64 SysVmsplice(struct Machine *m, i32 fildes, i64 iovaddr, u64 iovlen,
+                       u32 flags) {
+#ifdef __linux__
+  i64 rc;
+  struct Iovs iv;
+  // The direction (read vs write) depends on the pipe end. We don't know it
+  // here without checking the fd, so we use PROT_READ which lets the host
+  // kernel handle both directions — for the rare "splice FROM pipe INTO
+  // userspace" case (SPLICE_F_GIFT with read end), the guest memory will
+  // need to be writable; in that case AppendIovsGuest will catch it via the
+  // page permissions and the host call will EFAULT.
+  int prot = PROT_READ;
+  if (flags & ~SPLICE_F_ALL_LINUX) {
+    LOGF("vmsplice flags %#x not supported", flags);
+    return einval();
+  }
+  if (iovlen > IOV_MAX_LINUX) return einval();
+  if (!iovlen) return 0;
+  InitIovs(&iv);
+  if ((rc = AppendIovsGuest(m, &iv, iovaddr, (int)iovlen, prot)) != -1) {
+    if (iv.i) {
+      RESTARTABLE(rc = vmsplice(fildes, iv.p, iv.i, flags));
+    } else {
+      rc = 0;
+    }
+  }
+  FreeIovs(&iv);
+  return rc;
+#else
+  (void)m; (void)fildes; (void)iovaddr; (void)iovlen; (void)flags;
+  return enosys();
+#endif
+}
+
+static i32 SysPidfdOpen(struct Machine *m, i32 pid, u32 flags) {
+#ifdef __linux__
+  int oflags = O_RDWR;
+  // PIDFD_NONBLOCK = O_NONBLOCK = 0x800 in Linux; pass through to host.
+  if (flags & O_NDELAY_LINUX) {
+    oflags |= O_CLOEXEC;  // blink tracks nonblock via cloexec slot
+  }
+  // Unknown bits → let the host kernel reject (it'll return EINVAL).
+  int hfd = (int)syscall(SYS_pidfd_open, (pid_t)pid, (unsigned)flags);
+  return FinishHostFd(m, hfd, oflags);
+#else
+  (void)m; (void)pid; (void)flags;
+  return enosys();
+#endif
+}
+
+static i32 SysPidfdSendSignal(struct Machine *m, i32 pidfd, i32 sig,
+                              i64 infoaddr, u32 flags) {
+#ifdef __linux__
+  int syssig;
+  (void)m;
+  if (flags) {
+    LOGF("pidfd_send_signal flags %#x not supported", flags);
+    return einval();
+  }
+  if (infoaddr) {
+    // Non-NULL siginfo would require translating guest siginfo_linux to host
+    // siginfo_t — field layouts diverge in the union tail. Real callers
+    // (systemd, supervisors) pass NULL in the common path; refuse the rest
+    // so glibc's wrapper falls back rather than misdelivering.
+    LOGF("pidfd_send_signal with non-NULL info not supported");
+    return einval();
+  }
+  if (sig == 0) {
+    // Existence check only — host pidfd_send_signal(pidfd, 0, ...) works.
+    return (i32)syscall(SYS_pidfd_send_signal, pidfd, 0, (void *)0, 0u);
+  }
+  if ((syssig = XlatSignal(sig)) == -1) return einval();
+  return (i32)syscall(SYS_pidfd_send_signal, pidfd, syssig, (void *)0, 0u);
+#else
+  (void)m; (void)pidfd; (void)sig; (void)infoaddr; (void)flags;
+  return enosys();
+#endif
+}
+
+static i32 SysPidfdGetfd(struct Machine *m, i32 pidfd, i32 targetfd,
+                         u32 flags) {
+#ifdef __linux__
+  if (flags) {
+    LOGF("pidfd_getfd flags %#x not supported", flags);
+    return einval();
+  }
+  int hfd = (int)syscall(SYS_pidfd_getfd, pidfd, targetfd, flags);
+  return FinishHostFd(m, hfd, O_RDWR);
+#else
+  (void)m; (void)pidfd; (void)targetfd; (void)flags;
+  return enosys();
+#endif
+}
+
+// FreeBSD procctl command numbers (sys/sys/procctl.h).
+#define PROC_REAP_ACQUIRE_FBSD       2
+#define PROC_REAP_RELEASE_FBSD       3
+#define PROC_PDEATHSIG_CTL_FBSD     11
+#define PROC_PDEATHSIG_STATUS_FBSD  12
+#define PROC_NO_NEW_PRIVS_CTL_FBSD  19
+#define PROC_NO_NEW_PRIVS_STATUS_FBSD 20
+
+static int SysFreeBSDProcctl(struct Machine *m, i32 idtype, i64 id, i32 cmd,
+                             i64 dataaddr) {
+#ifdef __linux__
+  // We only support P_PID (1) — the common case is "this process" with id=0.
+  // P_PGID (2) and a few others exist but are rarely used by libc/apps.
+  if (idtype != 1 && idtype != 0) {
+    LOGF("procctl idtype %d not supported", idtype);
+    return einval();
+  }
+  if (id != 0 && id != m->system->pid) {
+    LOGF("procctl id=%" PRId64 " (only self supported)", id);
+    return einval();
+  }
+  switch (cmd) {
+    case PROC_PDEATHSIG_CTL_FBSD: {
+#ifdef PR_SET_PDEATHSIG
+      u8 buf[4];
+      int sig, hsig;
+      if (CopyFromUserRead(m, buf, dataaddr, sizeof(buf)) == -1) return -1;
+      sig = (i32)Read32(buf);
+      if (sig == 0) {
+        hsig = 0;  // clear pdeathsig
+      } else if ((hsig = XlatSignal(sig)) == -1) {
+        return einval();
+      }
+      return prctl(PR_SET_PDEATHSIG, hsig, 0, 0, 0);
+#else
+      return enosys();
+#endif
+    }
+    case PROC_PDEATHSIG_STATUS_FBSD: {
+#ifdef PR_GET_PDEATHSIG
+      int hsig = 0, sig;
+      u8 buf[4];
+      if (prctl(PR_GET_PDEATHSIG, (unsigned long)&hsig, 0, 0, 0) == -1) {
+        return -1;
+      }
+      sig = hsig ? UnXlatSignal(hsig) : 0;
+      Write32(buf, sig);
+      if (CopyToUserWrite(m, dataaddr, buf, sizeof(buf)) == -1) return -1;
+      return 0;
+#else
+      return enosys();
+#endif
+    }
+    case PROC_REAP_ACQUIRE_FBSD:
+#ifdef PR_SET_CHILD_SUBREAPER
+      return prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+#else
+      return enosys();
+#endif
+    case PROC_REAP_RELEASE_FBSD:
+#ifdef PR_SET_CHILD_SUBREAPER
+      return prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0);
+#else
+      return enosys();
+#endif
+    case PROC_NO_NEW_PRIVS_CTL_FBSD: {
+#ifdef PR_SET_NO_NEW_PRIVS
+      u8 buf[4];
+      int val;
+      if (CopyFromUserRead(m, buf, dataaddr, sizeof(buf)) == -1) return -1;
+      val = (i32)Read32(buf);
+      // FreeBSD allows enable (1) or disable (0); Linux only supports the
+      // one-way latch (enable). Refuse disable.
+      if (val == 0) return einval();
+      if (val != 1) return einval();
+      return prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+#else
+      return enosys();
+#endif
+    }
+    case PROC_NO_NEW_PRIVS_STATUS_FBSD: {
+#ifdef PR_GET_NO_NEW_PRIVS
+      int rc = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+      u8 buf[4];
+      if (rc == -1) return -1;
+      Write32(buf, rc);
+      if (CopyToUserWrite(m, dataaddr, buf, sizeof(buf)) == -1) return -1;
+      return 0;
+#else
+      return enosys();
+#endif
+    }
+    default:
+      LOGF("procctl cmd %d not supported", cmd);
+      return einval();
+  }
+#else
+  (void)m; (void)idtype; (void)id; (void)cmd; (void)dataaddr;
+  return enosys();
+#endif
+}
+
+static i32 SysFreeBSDPselect(struct Machine *m, i32 nfds, i64 readfds_addr,
+                             i64 writefds_addr, i64 exceptfds_addr,
+                             i64 timeout_addr, i64 sigmask_addr) {
+  u64 sigmask, *sigmaskp = 0;
+  const u8 *sm;
+  struct timespec timeout, *timeoutp;
+  if (timeout_addr) {
+    if (LoadTimespecRW(m, timeout_addr, &timeout) == -1) return -1;
+    timeoutp = &timeout;
+  } else {
+    timeoutp = 0;
+  }
+  if (sigmask_addr) {
+    // FreeBSD sigset_t is 16 bytes (4 u32). The lowest 8 bytes cover signals
+    // 1..64 in little-endian layout, which is what Select() wants.
+    if (!(sm = (const u8 *)SchlepR(m, sigmask_addr, 8))) return -1;
+    sigmask = Read64(sm);
+    sigmaskp = &sigmask;
+  }
+  return Select(m, nfds, readfds_addr, writefds_addr, exceptfds_addr, timeoutp,
+                sigmaskp);
+}
+
+static int SysFreeBSDChflags(struct Machine *m, u32 flags) {
+  // FreeBSD UF_/SF_ flags don't map cleanly to Linux FS_*FL_ via FS_IOC_*FLAGS,
+  // and most common callers (rm, tar -p, pkg) only want to *clear* flags before
+  // removing/updating a file. Accept flags==0 silently; refuse anything else so
+  // callers can detect and skip.
+  (void)m;
+  if (flags == 0) return 0;
+  LOGF("chflags(flags=%#x) not supported", flags);
+  errno = EOPNOTSUPP;
+  return -1;
+}
+
+static int SysFreeBSDThrSetName(struct Machine *m, long id, i64 nameaddr) {
+  const char *name;
+  char buf[16];
+  if (!(name = LoadStr(m, nameaddr))) return -1;
+  // Kernel comm field is 15 bytes + nul.
+  snprintf(buf, sizeof(buf), "%s", name);
+#ifdef __linux__
+  if (id == -1 || id == 0 || id == m->tid) {
+#ifdef PR_SET_NAME
+    return prctl(PR_SET_NAME, (unsigned long)buf, 0, 0, 0);
+#else
+    return 0;
+#endif
+  }
+  {
+    char path[64];
+    int fd, rc;
+    snprintf(path, sizeof(path), "/proc/self/task/%ld/comm", id);
+    if ((fd = open(path, O_WRONLY | O_CLOEXEC)) == -1) return -1;
+    rc = write(fd, buf, strlen(buf));
+    close(fd);
+    return rc == -1 ? -1 : 0;
+  }
+#else
+  (void)m; (void)id;
+  return 0;
+#endif
+}
+
 static int SysSysarch(struct Machine* m, int op, i64 parms) {
   i64 addr;
   const u8* p;
@@ -8099,8 +8982,8 @@ void OpSyscall(P) {
         ax = 0xAB;
         break;  // setdomainname
       case 165:
-        ax = 0xFE;
-        break;  // sysarch
+        ax = 0xFE9;
+        break;  // sysarch (custom dispatch — 0xFE collides with Linux inotify_add_watch)
       case 181:
         ax = 0x06A;
         break;  // setgid
@@ -8196,8 +9079,8 @@ void OpSyscall(P) {
         break;  // clock_nanosleep
       }
       case 253:
-        ax = 0x0FD;
-        break;  // issetugid
+        ax = 0xFEA;
+        break;  // issetugid (custom dispatch — 0xFD collides with Linux inotify_init)
       case 272:
         ax = 0x1FD;
         break;  // getdents
@@ -8376,6 +9259,9 @@ void OpSyscall(P) {
       case 547:
         ax = 0x118;
         break;  // utimensat
+      case 595:
+        ax = 0x073;
+        break;  // getgroups (renumbered in FreeBSD 15+)
       case 596:
         ax = 0x074;
         break;  // setgroups
@@ -8398,14 +9284,58 @@ void OpSyscall(P) {
         ax = 0xFE4;
         break;  // kevent (64-byte struct)
       case 464:
-        ax = 0x18;
-        break;  // thr_set_name → sched_yield (stub)
-      case 530:
-        ax = 0x18;
-        break;  // posix_fallocate → sched_yield (stub, returns 0)
+        ax = 0xFEE;
+        break;  // thr_set_name
+      case 530: {
+        // FreeBSD: posix_fallocate(fd, offset, len)
+        // Linux:   fallocate(fd, mode=0, offset, len)
+        // Reshape rdi (fd) unchanged; rsi=offset → rdx; rdx=len → r10; rsi=0.
+        u64 fbsd_off = Get64(m->si);
+        u64 fbsd_len = Get64(m->dx);
+        Put64(m->si, 0);          // mode = 0
+        Put64(m->dx, fbsd_off);   // offset
+        Put64(m->r10, fbsd_len);  // len
+        ax = 0x11D;  // fallocate
+        break;
+      }
       case 531:
-        ax = 0x18;
-        break;  // posix_fadvise → sched_yield (stub, returns 0)
+        ax = 0xDD;
+        break;  // posix_fadvise → Linux fadvise64
+      case 522:
+        ax = 0xFEC;
+        break;  // pselect (FreeBSD-shape, plain sigmask*)
+      case 544:
+        ax = 0xFEB;
+        break;  // procctl
+      case 548: {
+        // FreeBSD: funlinkat(dfd, path, fd, flag) — fd is a verification arg.
+        // Linux:   unlinkat(dfd, path, flag). Drop the fd argument.
+        Put64(m->dx, Get64(m->r10));
+        ax = 0x107;  // unlinkat
+        break;
+      }
+      case 34:   // chflags(path, flags)
+      case 35:   // fchflags(fd, flags)
+      case 391: {  // lchflags(path, flags)
+        // Only `flags` matters for our reject-non-zero policy.
+        Put64(m->di, Get64(m->si));  // flags → rdi for SysFreeBSDChflags(flags)
+        ax = 0xFED;
+        break;
+      }
+      // mac_* family: not supported. Returning ENOSYS lets MAC-aware code
+      // detect absence and fall back.
+      case 382:  // __mac_get_proc
+      case 383:  // __mac_set_proc
+      case 384:  // __mac_get_fd
+      case 385:  // __mac_get_file
+      case 386:  // __mac_set_fd
+      case 387:  // __mac_set_file
+      case 388:  // extattrctl (often grouped with mac_*)
+      case 389:  // extattr_set_file
+      case 409:  // __mac_get_link
+      case 410:  // __mac_set_link
+        ax = 0xFFF;  // → DefaultCase → ENOSYS
+        break;
       case 545:
         ax = 0x10F;
         break;  // ppoll
@@ -8615,6 +9545,32 @@ void OpSyscall(P) {
 #ifndef DISABLE_NONPOSIX
     SYSCALL(2, 0x125, "pipe2", SysPipe2, STRACE_PIPE2);
     SYSCALL(2, 0x122, "eventfd2", SysEventfd2, STRACE_2);
+    SYSCALL(2, 0x13F, "memfd_create", SysMemfdCreate, STRACE_2);
+    SYSCALL(5, 0x14C, "statx", SysStatx, STRACE_5);
+    SYSCALL(3, 0x11A, "signalfd", SysSignalfd, STRACE_3);
+    SYSCALL(4, 0x121, "signalfd4", SysSignalfd4, STRACE_4);
+    SYSCALL(1, 0x11C, "eventfd", SysEventfd, STRACE_1);
+    SYSCALL(2, 0x11B, "timerfd_create", SysTimerfdCreate, STRACE_2);
+    SYSCALL(4, 0x11E, "timerfd_settime", SysTimerfdSettime, STRACE_4);
+    SYSCALL(2, 0x11F, "timerfd_gettime", SysTimerfdGettime, STRACE_2);
+    SYSCALL(0, 0x0FD, "inotify_init", SysInotifyInit, STRACE_0);
+    SYSCALL(1, 0x126, "inotify_init1", SysInotifyInit1, STRACE_1);
+    SYSCALL(3, 0x0FE, "inotify_add_watch", SysInotifyAddWatch, STRACE_3);
+    SYSCALL(2, 0x0FF, "inotify_rm_watch", SysInotifyRmWatch, STRACE_2);
+    SYSCALL(5, 0x0F7, "waitid", SysWaitid, STRACE_5);
+    SYSCALL(4, 0x1B5, "openat2", SysOpenat2, STRACE_4);
+    SYSCALL(2, 0x1B3, "clone3", SysClone3, STRACE_2);
+    SYSCALL(2, 0x095, "mlock", SysMlock, STRACE_2);
+    SYSCALL(2, 0x096, "munlock", SysMunlock, STRACE_2);
+    SYSCALL(1, 0x097, "mlockall", SysMlockall, STRACE_1);
+    SYSCALL(0, 0x098, "munlockall", SysMunlockall, STRACE_0);
+    SYSCALL(3, 0x145, "mlock2", SysMlock2, STRACE_3);
+    SYSCALL(6, 0x113, "splice", SysSplice, STRACE_6);
+    SYSCALL(4, 0x114, "tee", SysTee, STRACE_4);
+    SYSCALL(4, 0x116, "vmsplice", SysVmsplice, STRACE_4);
+    SYSCALL(2, 0x1B2, "pidfd_open", SysPidfdOpen, STRACE_2);
+    SYSCALL(4, 0x1A8, "pidfd_send_signal", SysPidfdSendSignal, STRACE_4);
+    SYSCALL(3, 0x1B6, "pidfd_getfd", SysPidfdGetfd, STRACE_3);
 #endif
     SYSCALL(6, 0x038, "clone", SysClone, STRACE_CLONE);
     SYSCALL(2, 0x0C8, "tkill", SysTkill, STRACE_TKILL);
@@ -8666,8 +9622,13 @@ void OpSyscall(P) {
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
-    SYSCALL(2, 0x0FE, "sysarch", SysSysarch, STRACE_2);
-    SYSCALL(0, 0x0FD, "issetugid", SysFreeBSDIssetugid, STRACE_0);
+    SYSCALL(2, 0xFE9, "sysarch", SysSysarch, STRACE_2);
+    SYSCALL(0, 0xFEA, "issetugid", SysFreeBSDIssetugid, STRACE_0);
+    SYSCALL(4, 0x11D, "fallocate", SysFallocate, STRACE_4);
+    SYSCALL(4, 0xFEB, "fbsd_procctl", SysFreeBSDProcctl, STRACE_4);
+    SYSCALL(6, 0xFEC, "fbsd_pselect", SysFreeBSDPselect, STRACE_6);
+    SYSCALL(1, 0xFED, "fbsd_chflags", SysFreeBSDChflags, STRACE_1);
+    SYSCALL(2, 0xFEE, "fbsd_thr_set_name", SysFreeBSDThrSetName, STRACE_2);
     SYSCALL(3, 0x0ED, "sigprocmask", SysFreeBSDSigprocmask, STRACE_3);
     SYSCALL(4, 0x1F6, "getdirentries", SysFreeBSDGetdirentries, STRACE_4);
     SYSCALL(3, 0x1FD, "getdents", SysFreeBSDGetdents, STRACE_3);
@@ -8793,36 +9754,45 @@ void OpSyscall(P) {
       break;
     }
     case 0xFE6: {
-      // inotify_add_watch_at(fd, dfd, pathname, mask)
-      // Stub: return a fake watch descriptor (incrementing)
-      static _Atomic(int) fake_wd;
-      ax = ++fake_wd;
-      break;
-    }
-    case 0xFE7:
-      // inotify_rm_watch(fd, wd)
-      ax = 0;
-      break;
-    case 0xFE8: {
-      // SPECIALFD_INOTIFY: create a pipe as inotify fd
-      // Keep write end alive so read() blocks instead of returning EOF
-      int pipefd[2];
-      if (pipe(pipefd) == 0) {
-        // Read flags from the original si register (struct specialfd_inotify)
-        // FreeBSD IN_NONBLOCK=0x4, IN_CLOEXEC=0x100000
-        int oflags = O_RDWR;
-        fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-        fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
-        fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
-        oflags |= O_CLOEXEC;
-        LOCK(&m->system->fds.lock);
-        unassert(AddFd(&m->system->fds, pipefd[0], oflags));
-        unassert(AddFd(&m->system->fds, pipefd[1], oflags));
-        UNLOCK(&m->system->fds.lock);
-        ax = pipefd[0];
+      // FreeBSD inotify_add_watch_at(fd, dfd, pathname, mask)
+      // di=fd, si=dfd, dx=pathname, r0=mask. We don't honor dfd because
+      // host inotify_add_watch doesn't take a dirfd; resolve relative paths
+      // via the FreeBSD chroot the same way LoadStr already does for di.
+#ifdef __linux__
+      const char *path = LoadStr(m, dx);
+      if (path) {
+        ax = inotify_add_watch((int)di, path, (u32)r0);
       } else {
         ax = -1;
       }
+#else
+      ax = enosys();
+#endif
+      break;
+    }
+    case 0xFE7:
+#ifdef __linux__
+      ax = inotify_rm_watch((int)di, (int)si);
+#else
+      ax = 0;
+#endif
+      break;
+    case 0xFE8: {
+      // FreeBSD __specialfd(SPECIALFD_INOTIFY, req, len). The flags live in
+      // a struct at si: { int flags; } with FreeBSD IN_NONBLOCK=4,
+      // IN_CLOEXEC=0x100000. Translate to Linux inotify_init1 flags.
+#ifdef __linux__
+      int linux_flags = 0;
+      u8 *req = LookupAddress(m, si);
+      if (req) {
+        i32 bsd_flags = (i32)Load32(req);
+        if (bsd_flags & 0x4) linux_flags |= O_NDELAY_LINUX;
+        if (bsd_flags & 0x100000) linux_flags |= O_CLOEXEC_LINUX;
+      }
+      ax = SysInotifyInit1(m, linux_flags);
+#else
+      ax = enosys();
+#endif
       break;
     }
     case 0xFE1: {
