@@ -7911,6 +7911,9 @@ void OpSyscall(P) {
       case 15:
         ax = 0x5a;
         break;  // chmod
+      case 124:
+        ax = 0x5b;
+        break;  // fchmod
       case 16:
         ax = 0x5c;
         break;  // chown
