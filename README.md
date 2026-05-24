@@ -1,6 +1,6 @@
 # Blink FreeBSD fork
 
-This is a for of the greatest project by JART(Justine Tunney), slightly enhanced with AI tools.
+This is a fork of the greatest project by JART(Justine Tunney), slightly enhanced with AI tools. Spetial thanks to the author.
 
 ## Functionality added
 
@@ -10,7 +10,7 @@ This is a for of the greatest project by JART(Justine Tunney), slightly enhanced
 
 ## What works
 
-The most important terminal utilities, curl, wget, mc, nano, gcc, w, python3.11, pkg, even thunar runs with X11.
+The most important terminal utilities, curl, wget, mc, nano, gcc, w, python3.11, pkg, even thunar runs with X11(Wayland is not yet fully working in FreeBSD itself).
 
 ## Getting started
 
