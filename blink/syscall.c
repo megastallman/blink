@@ -117,6 +117,7 @@
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/xattr.h>
 #endif
 
 #ifdef SO_LINGER_SEC
@@ -6868,6 +6869,376 @@ static int SysFreeBSDThrSetName(struct Machine *m, long id, i64 nameaddr) {
 #endif
 }
 
+// ----- Linux xattr family ---------------------------------------------------
+// All thin wrappers around the host xattr syscalls. Names/values pass through
+// unchanged. On non-Linux hosts we return ENOSYS so callers can detect-and-skip.
+
+#ifdef __linux__
+static i64 XattrGet(struct Machine *m, const char *path, int fd,
+                    i64 nameaddr, i64 valueaddr, u64 size, int kind) {
+  const char *name;
+  void *buf = 0;
+  ssize_t rc;
+  if (!(name = LoadStr(m, nameaddr))) return -1;
+  if (size && valueaddr) {
+    if (!(buf = AddToFreeList(m, malloc(size)))) return enomem();
+  }
+  // kind: 0=getxattr 1=lgetxattr 2=fgetxattr
+  if (kind == 0)      rc = getxattr(path, name, buf, size);
+  else if (kind == 1) rc = lgetxattr(path, name, buf, size);
+  else                rc = fgetxattr(fd, name, buf, size);
+  if (rc > 0 && valueaddr) {
+    if (CopyToUserWrite(m, valueaddr, buf, rc) == -1) return -1;
+  }
+  return rc;
+}
+
+static i64 XattrSet(struct Machine *m, const char *path, int fd,
+                    i64 nameaddr, i64 valueaddr, u64 size, i32 flags, int kind) {
+  const char *name;
+  void *buf = 0;
+  if (!(name = LoadStr(m, nameaddr))) return -1;
+  if (size) {
+    if (!(buf = AddToFreeList(m, malloc(size)))) return enomem();
+    if (CopyFromUserRead(m, buf, valueaddr, size) == -1) return -1;
+  }
+  if (kind == 0)      return setxattr(path, name, buf, size, flags);
+  else if (kind == 1) return lsetxattr(path, name, buf, size, flags);
+  else                return fsetxattr(fd, name, buf, size, flags);
+}
+
+static i64 XattrList(struct Machine *m, const char *path, int fd, i64 listaddr,
+                     u64 size, int kind) {
+  void *buf = 0;
+  ssize_t rc;
+  if (size && listaddr) {
+    if (!(buf = AddToFreeList(m, malloc(size)))) return enomem();
+  }
+  if (kind == 0)      rc = listxattr(path, buf, size);
+  else if (kind == 1) rc = llistxattr(path, buf, size);
+  else                rc = flistxattr(fd, buf, size);
+  if (rc > 0 && listaddr) {
+    if (CopyToUserWrite(m, listaddr, buf, rc) == -1) return -1;
+  }
+  return rc;
+}
+
+static i64 XattrRemove(struct Machine *m, const char *path, int fd,
+                       i64 nameaddr, int kind) {
+  const char *name;
+  if (!(name = LoadStr(m, nameaddr))) return -1;
+  if (kind == 0)      return removexattr(path, name);
+  else if (kind == 1) return lremovexattr(path, name);
+  else                return fremovexattr(fd, name);
+}
+#endif
+
+static i64 SysSetxattr(struct Machine *m, i64 pa, i64 na, i64 va, u64 sz, i32 fl) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrSet(m, p, -1, na, va, sz, fl, 0);
+#else
+  (void)m; (void)pa; (void)na; (void)va; (void)sz; (void)fl;
+  return enosys();
+#endif
+}
+static i64 SysLsetxattr(struct Machine *m, i64 pa, i64 na, i64 va, u64 sz, i32 fl) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrSet(m, p, -1, na, va, sz, fl, 1);
+#else
+  (void)m; (void)pa; (void)na; (void)va; (void)sz; (void)fl;
+  return enosys();
+#endif
+}
+static i64 SysFsetxattr(struct Machine *m, i32 fd, i64 na, i64 va, u64 sz, i32 fl) {
+#ifdef __linux__
+  return XattrSet(m, 0, fd, na, va, sz, fl, 2);
+#else
+  (void)m; (void)fd; (void)na; (void)va; (void)sz; (void)fl;
+  return enosys();
+#endif
+}
+static i64 SysGetxattr(struct Machine *m, i64 pa, i64 na, i64 va, u64 sz) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrGet(m, p, -1, na, va, sz, 0);
+#else
+  (void)m; (void)pa; (void)na; (void)va; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysLgetxattr(struct Machine *m, i64 pa, i64 na, i64 va, u64 sz) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrGet(m, p, -1, na, va, sz, 1);
+#else
+  (void)m; (void)pa; (void)na; (void)va; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysFgetxattr(struct Machine *m, i32 fd, i64 na, i64 va, u64 sz) {
+#ifdef __linux__
+  return XattrGet(m, 0, fd, na, va, sz, 2);
+#else
+  (void)m; (void)fd; (void)na; (void)va; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysListxattr(struct Machine *m, i64 pa, i64 la, u64 sz) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrList(m, p, -1, la, sz, 0);
+#else
+  (void)m; (void)pa; (void)la; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysLlistxattr(struct Machine *m, i64 pa, i64 la, u64 sz) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrList(m, p, -1, la, sz, 1);
+#else
+  (void)m; (void)pa; (void)la; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysFlistxattr(struct Machine *m, i32 fd, i64 la, u64 sz) {
+#ifdef __linux__
+  return XattrList(m, 0, fd, la, sz, 2);
+#else
+  (void)m; (void)fd; (void)la; (void)sz;
+  return enosys();
+#endif
+}
+static i64 SysRemovexattr(struct Machine *m, i64 pa, i64 na) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrRemove(m, p, -1, na, 0);
+#else
+  (void)m; (void)pa; (void)na;
+  return enosys();
+#endif
+}
+static i64 SysLremovexattr(struct Machine *m, i64 pa, i64 na) {
+#ifdef __linux__
+  const char *p = LoadStr(m, pa);
+  if (!p) return -1;
+  return XattrRemove(m, p, -1, na, 1);
+#else
+  (void)m; (void)pa; (void)na;
+  return enosys();
+#endif
+}
+static i64 SysFremovexattr(struct Machine *m, i32 fd, i64 na) {
+#ifdef __linux__
+  return XattrRemove(m, 0, fd, na, 2);
+#else
+  (void)m; (void)fd; (void)na;
+  return enosys();
+#endif
+}
+
+// ----- Linux misc easy stubs -----------------------------------------------
+
+static int SysPersonality(struct Machine *m, u64 pers) {
+  // PER_LINUX = 0. Most callers pass 0xffffffff to query the current value.
+  (void)m; (void)pers;
+  return 0;
+}
+
+static int SysMincore(struct Machine *m, i64 addr, u64 length, i64 vecaddr) {
+#ifdef __linux__
+  // Best-effort: report all pages as resident. Allocators that probe this
+  // (jemalloc) only use it as a hint; lying optimistically is fine.
+  (void)m; (void)addr;
+  unsigned char *buf;
+  size_t pages = (length + 4095) / 4096;
+  if (!pages) return 0;
+  if (!(buf = (unsigned char *)AddToFreeList(m, malloc(pages)))) return enomem();
+  memset(buf, 1, pages);  // bit 0 = resident
+  if (CopyToUserWrite(m, vecaddr, buf, pages) == -1) return -1;
+  return 0;
+#else
+  (void)m; (void)addr; (void)length; (void)vecaddr;
+  return enosys();
+#endif
+}
+
+static int SysSyncfs(struct Machine *m, i32 fd) {
+#ifdef __linux__
+  (void)m;
+  return syncfs(fd);
+#else
+  (void)m; (void)fd;
+  return enosys();
+#endif
+}
+
+static int SysSyncFileRange(struct Machine *m, i32 fd, i64 offset, i64 nbytes,
+                            u32 flags) {
+#ifdef __linux__
+  (void)m;
+  return sync_file_range(fd, offset, nbytes, flags);
+#else
+  (void)m; (void)fd; (void)offset; (void)nbytes; (void)flags;
+  return enosys();
+#endif
+}
+
+static int SysGetcpu(struct Machine *m, i64 cpuaddr, i64 nodeaddr, i64 tcache) {
+#ifdef __linux__
+  unsigned cpu = 0, node = 0;
+  (void)tcache;
+  syscall(SYS_getcpu, &cpu, &node, NULL);
+  if (cpuaddr) {
+    u8 buf[4]; Write32(buf, cpu);
+    if (CopyToUserWrite(m, cpuaddr, buf, 4) == -1) return -1;
+  }
+  if (nodeaddr) {
+    u8 buf[4]; Write32(buf, node);
+    if (CopyToUserWrite(m, nodeaddr, buf, 4) == -1) return -1;
+  }
+  return 0;
+#else
+  (void)m; (void)cpuaddr; (void)nodeaddr; (void)tcache;
+  return enosys();
+#endif
+}
+
+static int SysKcmp(struct Machine *m, i32 pid1, i32 pid2, i32 type, u64 idx1,
+                   u64 idx2) {
+#ifdef __linux__
+  (void)m;
+  return (int)syscall(SYS_kcmp, pid1, pid2, type, idx1, idx2);
+#else
+  (void)m; (void)pid1; (void)pid2; (void)type; (void)idx1; (void)idx2;
+  return enosys();
+#endif
+}
+
+static int SysSetfsuid(struct Machine *m, u32 uid) {
+#ifdef __linux__
+  (void)m;
+  return (int)syscall(SYS_setfsuid, uid);
+#else
+  (void)m; (void)uid;
+  return 0;  // pretend success on non-Linux hosts
+#endif
+}
+
+static int SysSetfsgid(struct Machine *m, u32 gid) {
+#ifdef __linux__
+  (void)m;
+  return (int)syscall(SYS_setfsgid, gid);
+#else
+  (void)m; (void)gid;
+  return 0;
+#endif
+}
+
+static int SysIoprioGet(struct Machine *m, i32 which, i32 who) {
+#ifdef __linux__
+  (void)m;
+  return (int)syscall(SYS_ioprio_get, which, who);
+#else
+  (void)m; (void)which; (void)who;
+  return 0;  // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_NONE, 0) — host default
+#endif
+}
+
+static int SysIoprioSet(struct Machine *m, i32 which, i32 who, i32 ioprio) {
+#ifdef __linux__
+  (void)m;
+  return (int)syscall(SYS_ioprio_set, which, who, ioprio);
+#else
+  (void)m; (void)which; (void)who; (void)ioprio;
+  return 0;
+#endif
+}
+
+// ----- FreeBSD-only handlers -----------------------------------------------
+
+static int SysFreeBSDPdkill(struct Machine *m, i32 fildes, i32 sig) {
+  struct Fd *fd;
+  i32 pid;
+  int hsig;
+  LOCK(&m->system->fds.lock);
+  fd = GetFd(&m->system->fds, fildes);
+  pid = (fd && fd->pdpid) ? fd->pdpid : 0;
+  UNLOCK(&m->system->fds.lock);
+  if (!fd) return ebadf();
+  if (!pid) return einval();  // not a process descriptor
+  if (sig == 0) return kill(pid, 0);
+  if ((hsig = XlatSignal(sig)) == -1) return einval();
+  return kill(pid, hsig);
+}
+
+static int SysFreeBSDKenv(struct Machine *m, i32 action, i64 nameaddr,
+                          i64 valueaddr, i32 len) {
+  // FreeBSD kenv(2) — action: 0=GET, 1=SET, 2=UNSET, 3=DUMP. We support GET
+  // by reading the host environment; everything else fails politely so init
+  // scripts can detect and skip.
+  if (action != 0) {
+    errno = EPERM;
+    return -1;
+  }
+  const char *name = LoadStr(m, nameaddr);
+  if (!name) return -1;
+  const char *val = getenv(name);
+  if (!val) {
+    errno = ENOENT;
+    return -1;
+  }
+  size_t vl = strlen(val) + 1;
+  if ((i32)vl > len) {
+    errno = ENOMEM;
+    return -1;
+  }
+  if (CopyToUserWrite(m, valueaddr, val, vl) == -1) return -1;
+  return (int)vl - 1;
+}
+
+static int SysFreeBSDSetlogin(struct Machine *m, i64 nameaddr) {
+  // Accept and ignore — chrooted code rarely has a real login session.
+  (void)m;
+  const char *n = LoadStr(m, nameaddr);
+  if (!n) return -1;
+  return 0;
+}
+
+static int SysFreeBSDGetloginclass(struct Machine *m, i64 nameaddr, u64 len) {
+  const char *def = "default";
+  size_t dl = strlen(def) + 1;
+  if (len < dl) {
+    errno = ERANGE;
+    return -1;
+  }
+  if (CopyToUserWrite(m, nameaddr, def, dl) == -1) return -1;
+  return 0;
+}
+
+static int SysFreeBSDSetloginclass(struct Machine *m, i64 nameaddr) {
+  (void)m;
+  const char *n = LoadStr(m, nameaddr);
+  if (!n) return -1;
+  return 0;
+}
+
+static int SysFreeBSDSetfib(struct Machine *m, i32 fib) {
+  (void)m;
+  if (fib == 0) return 0;
+  errno = EINVAL;  // we only know about the default FIB
+  return -1;
+}
+
 static int SysSysarch(struct Machine* m, int op, i64 parms) {
   i64 addr;
   const u8* p;
@@ -9350,6 +9721,44 @@ void OpSyscall(P) {
       case 596:
         ax = 0x074;
         break;  // setgroups
+      case 50:
+        ax = 0xFF4;
+        break;  // setlogin
+      case 175:
+        ax = 0xFF7;
+        break;  // setfib
+      case 390:
+        ax = 0xFF3;
+        break;  // kenv
+      case 519:
+        ax = 0xFF2;
+        break;  // pdkill
+      case 523:
+        ax = 0xFF5;
+        break;  // getloginclass
+      case 524:
+        ax = 0xFF6;
+        break;  // setloginclass
+      // FreeBSD-specific syscalls we don't yet implement: return ENOSYS
+      // cleanly so callers can fall back rather than panic.
+      case 297:   // fhstatfs (old)
+      case 298:   // fhopen
+      case 299:   // fhstat (old)
+      case 355:   // extattrctl
+      case 356:   // extattr_set_file
+      case 357:   // extattr_get_file
+      case 358:   // extattr_delete_file
+      case 371:   // extattr_set_fd
+      case 372:   // extattr_get_fd
+      case 373:   // extattr_delete_fd
+      case 412:   // extattr_set_link
+      case 413:   // extattr_get_link
+      case 414:   // extattr_delete_link
+      case 437:   // extattr_list_fd
+      case 438:   // extattr_list_file
+      case 439:   // extattr_list_link
+        ax = 0xFFF;
+        break;
       case 376:
         ax = 0xFE0;
         break;  // eaccess
@@ -9726,6 +10135,36 @@ void OpSyscall(P) {
     SYSCALL(1, 0xFEF, "fbsd_posix_openpt", SysFreeBSDPosixOpenpt, STRACE_1);
     SYSCALL(2, 0xFF0, "fbsd_pdgetpid", SysFreeBSDPdgetpid, STRACE_2);
     SYSCALL(2, 0xFF1, "fbsd_getlogin", SysFreeBSDGetlogin, STRACE_2);
+    SYSCALL(2, 0xFF2, "fbsd_pdkill", SysFreeBSDPdkill, STRACE_2);
+    SYSCALL(4, 0xFF3, "fbsd_kenv", SysFreeBSDKenv, STRACE_4);
+    SYSCALL(1, 0xFF4, "fbsd_setlogin", SysFreeBSDSetlogin, STRACE_1);
+    SYSCALL(2, 0xFF5, "fbsd_getloginclass", SysFreeBSDGetloginclass, STRACE_2);
+    SYSCALL(1, 0xFF6, "fbsd_setloginclass", SysFreeBSDSetloginclass, STRACE_1);
+    SYSCALL(1, 0xFF7, "fbsd_setfib", SysFreeBSDSetfib, STRACE_1);
+    // Linux xattr family (0xbc..0xc7)
+    SYSCALL(5, 0x0BC, "setxattr", SysSetxattr, STRACE_5);
+    SYSCALL(5, 0x0BD, "lsetxattr", SysLsetxattr, STRACE_5);
+    SYSCALL(5, 0x0BE, "fsetxattr", SysFsetxattr, STRACE_5);
+    SYSCALL(4, 0x0BF, "getxattr", SysGetxattr, STRACE_4);
+    SYSCALL(4, 0x0C0, "lgetxattr", SysLgetxattr, STRACE_4);
+    SYSCALL(4, 0x0C1, "fgetxattr", SysFgetxattr, STRACE_4);
+    SYSCALL(3, 0x0C2, "listxattr", SysListxattr, STRACE_3);
+    SYSCALL(3, 0x0C3, "llistxattr", SysLlistxattr, STRACE_3);
+    SYSCALL(3, 0x0C4, "flistxattr", SysFlistxattr, STRACE_3);
+    SYSCALL(2, 0x0C5, "removexattr", SysRemovexattr, STRACE_2);
+    SYSCALL(2, 0x0C6, "lremovexattr", SysLremovexattr, STRACE_2);
+    SYSCALL(2, 0x0C7, "fremovexattr", SysFremovexattr, STRACE_2);
+    // Linux misc easy stubs
+    SYSCALL(1, 0x087, "personality", SysPersonality, STRACE_1);
+    SYSCALL(3, 0x01B, "mincore", SysMincore, STRACE_3);
+    SYSCALL(1, 0x132, "syncfs", SysSyncfs, STRACE_1);
+    SYSCALL(4, 0x115, "sync_file_range", SysSyncFileRange, STRACE_4);
+    SYSCALL(3, 0x135, "getcpu", SysGetcpu, STRACE_3);
+    SYSCALL(5, 0x138, "kcmp", SysKcmp, STRACE_5);
+    SYSCALL(1, 0x07A, "setfsuid", SysSetfsuid, STRACE_1);
+    SYSCALL(1, 0x07B, "setfsgid", SysSetfsgid, STRACE_1);
+    SYSCALL(2, 0x0FB, "ioprio_get", SysIoprioGet, STRACE_2);
+    SYSCALL(3, 0x0FC, "ioprio_set", SysIoprioSet, STRACE_3);
     SYSCALL(3, 0x0ED, "sigprocmask", SysFreeBSDSigprocmask, STRACE_3);
     SYSCALL(4, 0x1F6, "getdirentries", SysFreeBSDGetdirentries, STRACE_4);
     SYSCALL(3, 0x1FD, "getdents", SysFreeBSDGetdents, STRACE_3);
@@ -9787,9 +10226,6 @@ void OpSyscall(P) {
     case 0x0C9:
       // time() is also noisy in some environments.
       ax = SysTime(m, di);
-      break;
-    case 0x0FC:
-      ax = SysFreeBSDFstat(m, di, si);
       break;
     case 0x0FA:
       ax = -38;  // ENOSYS (sysctl stub)
