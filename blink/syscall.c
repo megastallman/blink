@@ -9012,6 +9012,9 @@ void OpSyscall(P) {
       case 82:
         ax = 0x6d;
         break;  // setpgid
+      case 83:
+        ax = 0x26;
+        break;  // setitimer
       case 99:
         ax = 0x200;
         break;  // sigsuspend (FreeBSD 4-byte sigset variant)
@@ -9229,6 +9232,9 @@ void OpSyscall(P) {
       case 116:
         ax = 0x60;
         break;  // gettimeofday
+      case 117:
+        ax = 0x62;
+        break;  // getrusage
       case 118:
         ax = 0x37;
         break;  // getsockopt

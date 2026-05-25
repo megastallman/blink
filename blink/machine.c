@@ -33,6 +33,7 @@
 #include "blink/bus.h"
 #include "blink/case.h"
 #include "blink/debug.h"
+#include "blink/signal.h"
 #include "blink/endian.h"
 #include "blink/flag.h"
 #include "blink/flags.h"
@@ -2185,6 +2186,15 @@ void ExecuteInstruction(struct Machine *m) {
 #if LOG_CPU
   LogCpu(m);
 #endif
+  // FreeBSD signal trampoline: when a signal handler returns, control
+  // jumps here. We never back this page with real bytes — it's purely an
+  // address that means "the guest is asking for sigreturn." Recognize it
+  // before any JIT/fetch logic so we don't try to compile or execute
+  // anything at this fake address.
+  if (m->system->sigtramp && m->ip == m->system->sigtramp) {
+    SigRestore(m);
+    return;
+  }
 #ifdef HAVE_JIT
   u8 *dst;
   nexgen32e_f func;

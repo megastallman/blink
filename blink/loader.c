@@ -821,22 +821,16 @@ error: unsupported executable; we need:\n\
     }
     m->system->loaded = true;  // in case rwx stack is smc write-protected :'(
     // FreeBSD doesn't use sa_restorer like Linux. The kernel provides a
-    // signal trampoline via PS_STRINGS. We need to provide one ourselves:
-    // a small executable page with "mov $0x1a1,%rax; syscall" (sigreturn).
-    // NOTE: Only set up for the initial process, not for child processes
-    // spawned via posix_spawn/fork+exec, because those inherit the trampoline.
-    if (0 && m->system->isfreebsd && !m->system->sigtramp) {
-      i64 tramp = 0x7fff0000;
-      tramp = ReserveVirtual(m->system, tramp, 4096,
-                             PAGE_FILE | PAGE_U | PAGE_RW, -1, 0, 0, 0);
-      if (tramp != -1) {
-        // mov $0x1a1,%rax (FreeBSD sigreturn=417); syscall
-        static const u8 code[] = {0x48, 0xc7, 0xc0, 0xa1, 0x01, 0x00, 0x00,
-                                  0x0f, 0x05};
-        u8 *p = LookupAddress(m, tramp);
-        if (p) memcpy(p, code, sizeof(code));
-        m->system->sigtramp = tramp;
-      }
+    // signal trampoline via PS_STRINGS. We don't allocate a real page for
+    // it — instead we pick a magic address that ExecuteInstruction()
+    // intercepts at fetch time and dispatches to SigRestore directly.
+    // sigaction() at syscall.c:7982 wires this address into hand.restorer
+    // for every FreeBSD signal handler; DeliverSignal pushes it as the
+    // handler's return address. When the handler ret's, control "jumps"
+    // here and the interpreter recognizes it. This avoids the JIT/SMC
+    // dance that fails for a real RWX guest page under -m mode.
+    if (m->system->isfreebsd && !m->system->sigtramp) {
+      m->system->sigtramp = 0x7fff0000;
     }
     LoadArgv(m, execfn, prog, args, vars, elf->rng);
   }
