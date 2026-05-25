@@ -554,7 +554,10 @@ static void AddFileMapViaMap(struct System *s, i64 virt, i64 size, int fildes,
   struct Fd *fd;
   struct FileMap *fm;
   LOCK(&s->fds.lock);
-  path = (fd = GetFd(&s->fds, fildes)) ? strdup(fd->path) : 0;
+  fd = GetFd(&s->fds, fildes);
+  // fd->path is only set by SysOpenat; fds from socket/pipe/eventfd/posix_openpt
+  // leave it NULL. strdup(NULL) is undefined, so guard explicitly.
+  path = (fd && fd->path) ? strdup(fd->path) : 0;
   UNLOCK(&s->fds.lock);
   fm = AddFileMap(s, virt, size, path, offset);
   free(path);

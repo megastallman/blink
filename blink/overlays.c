@@ -213,6 +213,18 @@ int OverlaysChdir(const char *path) {
   return Chdir(path);
 }
 
+// Standard device files that we'll satisfy from the host if the chroot
+// doesn't have them. Apps assume these always exist (they're kernel-provided
+// on a real system), but minimal chroots often skip them.
+static bool IsStandardDevice(const char *path) {
+  return !strcmp(path, "/dev/null") ||      //
+         !strcmp(path, "/dev/zero") ||      //
+         !strcmp(path, "/dev/full") ||      //
+         !strcmp(path, "/dev/random") ||    //
+         !strcmp(path, "/dev/urandom") ||   //
+         !strcmp(path, "/dev/tty");
+}
+
 int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
   int fd;
   size_t i;
@@ -221,6 +233,16 @@ int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
   if (!*path) return enoent();
   if (path[0] != '/' && path[0]) {
     return openat(dirfd, path, flags, mode);
+  }
+  // Pty device paths are always satisfied from the host. The guest's chroot
+  // typically lacks /dev/pts/, but the host's pty allocator (used by our
+  // posix_openpt impl) names slaves /dev/pts/N — the guest must be able to
+  // open that exact path back. This bypass is narrow and read/write-only by
+  // file path; it doesn't broaden the chroot for anything else.
+  if (!strncmp(path, "/dev/pts/", 9) || !strcmp(path, "/dev/ptmx")) {
+    if ((fd = open(path, flags, mode)) != -1) return fd;
+    if (errno != ENOENT && errno != ENOTDIR) return -1;
+    // fall through to normal overlay search if host doesn't have it
   }
   for (i = 0; g_overlays[i]; ++i) {
     if (!*g_overlays[i]) {
@@ -259,6 +281,11 @@ int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
         return -1;
       }
     }
+  }
+  // Standard device files: if no overlay had them, fall back to host. Lets
+  // users skip the chore of symlinking /dev/null & co. into every chroot.
+  if ((err == ENOENT || err == ENOTDIR) && IsStandardDevice(path)) {
+    if ((fd = open(path, flags, mode)) != -1) return fd;
   }
   unassert(err != -1);
   errno = err;

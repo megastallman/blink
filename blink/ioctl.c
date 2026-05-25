@@ -708,6 +708,47 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlFionclex(m, fildes);
     case 0x4004667fu:  // FreeBSD FIONREAD
       return IoctlGetInt32(m, fildes, FIONREAD, addr);
+    case 0x2000741cu:  // FreeBSD TIOCPTMASTER — grantpt(3) probes this.
+      // Returns 0 on master end; ENOTTY otherwise. We know any fd we handed
+      // back from posix_openpt is a master; trust it and succeed.
+      (void)m; (void)addr;
+      return 0;
+    case 0x80106678u: {  // FreeBSD FIODGNAME — powers ptsname(3) on FreeBSD
+      // struct fiodgname_arg { int len; void *buf; }  (16 bytes total: 4 len,
+      // 4 pad, 8 buf-ptr on x86-64).
+      const u8 *gp;
+      i32 buflen;
+      i64 bufaddr;
+      char hname[256];
+      size_t hlen;
+      if (!(gp = (const u8 *)SchlepR(m, addr, 16))) return -1;
+      buflen = Read32(gp);
+      bufaddr = Read64(gp + 8);
+      if (buflen <= 0 || buflen > (i32)sizeof(hname)) return einval();
+#ifdef TIOCGPTN
+      {
+        int ptn;
+        // FreeBSD's FIODGNAME returns just the device name (e.g. "pts/0"),
+        // without the /dev/ prefix — libc prepends "/dev/" itself.
+        if (VfsIoctl(fildes, TIOCGPTN, &ptn) == -1) return -1;
+        snprintf(hname, sizeof(hname), "pts/%d", ptn);
+      }
+#else
+      {
+        char *p = ptsname(fildes);
+        if (!p) return -1;
+        if (!strncmp(p, "/dev/", 5)) p += 5;
+        snprintf(hname, sizeof(hname), "%s", p);
+      }
+#endif
+      hlen = strlen(hname) + 1;
+      if ((size_t)buflen < hlen) {
+        errno = EINVAL;
+        return -1;
+      }
+      if (CopyToUserWrite(m, bufaddr, hname, hlen) == -1) return -1;
+      return 0;
+    }
     default:
       LOGF("missing ioctl %#" PRIx64, request);
       return einval();

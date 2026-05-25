@@ -526,6 +526,7 @@ static int SysFreeBSDpdfork(struct Machine* m, i64 fdpaddr, i32 flags) {
     LOCK(&m->system->fds.lock);
     if ((fd = AddFd(&m->system->fds, sv[0], O_CLOEXEC))) {
       int guestfd = fd->fildes;
+      fd->pdpid = rc;  // remember the child pid for pdgetpid(2)
       UNLOCK(&m->system->fds.lock);
       if (CopyToUserWrite(m, fdpaddr, &guestfd, 4) == -1) {
         return -1;
@@ -6760,6 +6761,84 @@ static int SysFreeBSDChflags(struct Machine *m, u32 flags) {
   return -1;
 }
 
+static int SysFreeBSDPdgetpid(struct Machine *m, i32 fildes, i64 pidaddr) {
+  struct Fd *fd;
+  i32 pid;
+  LOCK(&m->system->fds.lock);
+  fd = GetFd(&m->system->fds, fildes);
+  pid = (fd && fd->pdpid) ? fd->pdpid : 0;
+  UNLOCK(&m->system->fds.lock);
+  if (!fd) return ebadf();
+  if (!pid) return einval();  // fd isn't a process descriptor
+  {
+    u8 buf[4];
+    Write32(buf, pid);
+    if (CopyToUserWrite(m, pidaddr, buf, 4) == -1) return -1;
+  }
+  return 0;
+}
+
+static int SysFreeBSDGetlogin(struct Machine *m, i64 nameaddr, u32 namelen) {
+  // Real lookups would need /etc/passwd. For chroots that may lack it, return
+  // a stable placeholder so callers don't fall over. Most apps treat this as
+  // a hint, not an authentication credential.
+  const char *name;
+#ifdef __linux__
+  if (!(name = getlogin())) name = "root";
+#else
+  name = "root";
+#endif
+  size_t nlen = strlen(name) + 1;
+  if ((size_t)namelen < nlen) {
+    errno = ERANGE;
+    return -1;
+  }
+  if (CopyToUserWrite(m, nameaddr, name, nlen) == -1) return -1;
+  return 0;
+}
+
+static i32 SysFreeBSDPosixOpenpt(struct Machine *m, i32 fbsd_flags) {
+  // Translate FreeBSD oflags → host oflags. posix_openpt only honors a small
+  // subset (O_RDWR, O_NOCTTY, O_NONBLOCK, O_CLOEXEC).
+  // FreeBSD: O_RDWR=2, O_NONBLOCK=4, O_NOCTTY=0x8000, O_CLOEXEC=0x100000
+  int hflags = 0;
+  int oflags = O_RDWR;
+  if ((fbsd_flags & 3) == 2) hflags |= O_RDWR;
+  if ((fbsd_flags & 3) == 1) hflags |= O_WRONLY;
+  if (fbsd_flags & 0x4) hflags |= O_NONBLOCK;
+  if (fbsd_flags & 0x8000) hflags |= O_NOCTTY;
+  if (fbsd_flags & 0x100000) {
+    hflags |= O_CLOEXEC;
+    oflags |= O_CLOEXEC;
+  }
+  int lim, fildes;
+  if (!(lim = GetFileDescriptorLimit(m->system))) return emfile();
+  // Deliberately bypass VFS/chroot — the chroot rarely contains a working
+  // /dev/ptmx, but the host's pty allocator is what we actually want to
+  // use. The returned slave (/dev/pts/N) still has to be reachable by the
+  // guest; the user is expected to bind-mount or symlink /dev/pts into the
+  // chroot if they want the slave open to succeed.
+  RESTARTABLE(fildes = open("/dev/ptmx", hflags));
+  if (fildes == -1) return -1;
+  if (fildes >= lim) {
+    close(fildes);
+    return emfile();
+  }
+#ifdef TIOCSPTLCK
+  // Linux ptmx hands the slave back locked; userspace must call
+  // ioctl(TIOCSPTLCK, &0) before the slave is openable. FreeBSD's unlockpt
+  // is a no-op, so the guest will never make this call itself — do it now.
+  {
+    int unlock = 0;
+    ioctl(fildes, TIOCSPTLCK, &unlock);
+  }
+#endif
+  LOCK(&m->system->fds.lock);
+  unassert(AddFd(&m->system->fds, fildes, oflags));
+  UNLOCK(&m->system->fds.lock);
+  return fildes;
+}
+
 static int SysFreeBSDThrSetName(struct Machine *m, long id, i64 nameaddr) {
   const char *name;
   char buf[16];
@@ -9314,6 +9393,15 @@ void OpSyscall(P) {
         ax = 0x107;  // unlinkat
         break;
       }
+      case 504:
+        ax = 0xFEF;
+        break;  // posix_openpt
+      case 520:
+        ax = 0xFF0;
+        break;  // pdgetpid
+      case 49:
+        ax = 0xFF1;
+        break;  // getlogin
       case 34:   // chflags(path, flags)
       case 35:   // fchflags(fd, flags)
       case 391: {  // lchflags(path, flags)
@@ -9629,6 +9717,9 @@ void OpSyscall(P) {
     SYSCALL(6, 0xFEC, "fbsd_pselect", SysFreeBSDPselect, STRACE_6);
     SYSCALL(1, 0xFED, "fbsd_chflags", SysFreeBSDChflags, STRACE_1);
     SYSCALL(2, 0xFEE, "fbsd_thr_set_name", SysFreeBSDThrSetName, STRACE_2);
+    SYSCALL(1, 0xFEF, "fbsd_posix_openpt", SysFreeBSDPosixOpenpt, STRACE_1);
+    SYSCALL(2, 0xFF0, "fbsd_pdgetpid", SysFreeBSDPdgetpid, STRACE_2);
+    SYSCALL(2, 0xFF1, "fbsd_getlogin", SysFreeBSDGetlogin, STRACE_2);
     SYSCALL(3, 0x0ED, "sigprocmask", SysFreeBSDSigprocmask, STRACE_3);
     SYSCALL(4, 0x1F6, "getdirentries", SysFreeBSDGetdirentries, STRACE_4);
     SYSCALL(3, 0x1FD, "getdents", SysFreeBSDGetdents, STRACE_3);

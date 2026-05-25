@@ -65,6 +65,6 @@ echo "nameserver 8.8.8.8" > "${DEST}/etc/resolv.conf"
 
 echo "Done. FreeBSD ${LATEST_RELEASE} base unpacked to ${DEST}/"
 
-echo "We need host /dev/null symlinked into rootfs"
-chmod u+w "${DEST}/dev"
-ln -sf /dev/null "${DEST}/dev/null"
+#echo "We need host /dev/null symlinked into rootfs"
+#chmod u+w "${DEST}/dev"
+#ln -sf /dev/null "${DEST}/dev/null"
