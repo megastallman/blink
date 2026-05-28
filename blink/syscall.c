@@ -7390,15 +7390,22 @@ static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
       return 0;
     case 8: { // UMTX_OP_CV_WAIT
       // obj = ucond*, val = flags/clock_id, uaddr1 = umutex*, uaddr2 = timespec*
-      // libthr unlocks the mutex in userspace before calling this.
-      // We just need to sleep on the ucond until signaled.
+      // libthr unlocks the mutex in userspace before calling this; we just
+      // need to sleep on the ucond until CV_SIGNAL/CV_BROADCAST wakes us.
+      //
+      // The FreeBSD kernel ALWAYS sets ucond->c_has_waiters = 1 and sleeps;
+      // we must do the same. An earlier version returned 0 immediately when
+      // it observed c_has_waiters == 0, but that's a spurious wake from
+      // libthr's POV: libthr left the thread on its userspace sleepq, the
+      // caller loops back into pthread_cond_wait, and the second sleepq_add
+      // panics with "thread %p was already on queue" (libthr thr_cond.c).
+      // LibreOffice's Qt thread pool tripped this within ~20s of startup.
       u8 *cv_mem = LookupAddress(m, obj);
       if (!cv_mem) return efault();
-      u32 has_waiters = Load32(cv_mem);
-      if (has_waiters == 0) return 0;
+      _Atomic(u32) *atom = (_Atomic(u32) *)cv_mem;
+      atomic_store_explicit(atom, 1, memory_order_release);
       if (IsOrphan(m)) return 0;
-      // Sleep on ucond's c_has_waiters field until CV_SIGNAL/CV_BROADCAST.
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, has_waiters, uaddr2);
+      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, 1, uaddr2);
     }
     case 9:   // UMTX_OP_CV_SIGNAL
       return SysFutexWake(m, obj, 1);
