@@ -7647,6 +7647,33 @@ static int SysFreeBSDStub0(struct Machine *m) {
   return 0;
 }
 
+// getdtablesize() — max number of open file descriptors. Real FreeBSD reads
+// kern.maxfilesperproc; we mirror Linux's getrlimit(RLIMIT_NOFILE) here.
+static int SysFreeBSDGetdtablesize(struct Machine *m) {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0) return (int)rl.rlim_cur;
+  return 1024;
+}
+
+// FreeBSD audit syscalls (auditon, getauid, etc.) — return 0/success quietly.
+// Most callers (su, login) treat audit absence as benign.
+static int SysFreeBSDAuditStub(struct Machine *m) {
+  return 0;
+}
+
+// FreeBSD getpriority(which, who) — return 0 (normal priority). Mapping to
+// Linux getpriority(2) would work but Linux returns `20 - nice` and FreeBSD
+// returns `nice` directly, so semantics differ. Stub to 0 is safe.
+static int SysFreeBSDGetpriority(struct Machine *m, int which, int who) {
+  return 0;
+}
+
+// FreeBSD setpriority(which, who, prio) — accept silently.
+static int SysFreeBSDSetpriority(struct Machine *m, int which, int who,
+                                 int prio) {
+  return 0;
+}
+
 // FreeBSD futimens(fd, times) → utimensat(fd, NULL, times, 0)
 static int SysFreeBSDFutimens(struct Machine *m, i32 fd, i64 tvsaddr) {
   return SysUtimensat(m, fd, 0, tvsaddr, 0);
@@ -9037,6 +9064,30 @@ static int SysFreeBSDSysctlbyname(struct Machine* m, i64 nameaddr,
       }
       return 0;
     }
+    if (!strcmp(buf, "kern.securelevel")) {
+      // -1 = "no securelevel", i.e. permissive. Matches a freshly booted
+      // FreeBSD system before init raises it. Many tools (pkg, su, login)
+      // check this to gate behaviour.
+      i32 val = -1;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &val, sizeof(val)) == -1)
+        return -1;
+      if (oldlenaddr) {
+        u64 len = sizeof(val);
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      }
+      return 0;
+    }
+    if (!strcmp(buf, "kern.console")) {
+      // FreeBSD format: "available,,active,". Empty active list is fine —
+      // su/login query this just to log; they don't care about contents.
+      const char *s = ",,,";
+      u64 slen = strlen(s) + 1;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, s, slen) == -1) return -1;
+      if (oldlenaddr) {
+        if (CopyToUserWrite(m, oldlenaddr, &slen, 8) == -1) return -1;
+      }
+      return 0;
+    }
     // Common knobs servers probe at startup. Return plausible defaults so
     // the guest's sizing/heuristics get a sane value rather than ENOENT.
     {
@@ -9822,6 +9873,38 @@ void OpSyscall(P) {
       case 312:        // setresgid(rgid, egid, sgid)
         ax = 0x077;    // Linux setresgid
         break;
+      case 89:         // getdtablesize()
+        ax = 0xFF8;
+        break;
+      case 96:         // setpriority(which, who, prio)
+        ax = 0xFF9;
+        break;
+      case 100:        // getpriority(which, who)
+        ax = 0xFFA;
+        break;
+      case 182:        // setegid(egid) → setresgid(-1, egid, -1)
+        Put64(m->si, Get64(m->di));
+        Put64(m->di, -1);
+        Put64(m->dx, -1);
+        ax = 0x077;    // Linux setresgid
+        break;
+      case 183:        // seteuid(euid) → setresuid(-1, euid, -1)
+        Put64(m->si, Get64(m->di));
+        Put64(m->di, -1);
+        Put64(m->dx, -1);
+        ax = 0x075;    // Linux setresuid
+        break;
+      case 445:        // audit(record, len)
+      case 446:        // auditon(cmd, data, len)
+      case 447:        // getauid(auid)
+      case 448:        // setauid(auid)
+      case 449:        // getaudit(ai)
+      case 450:        // setaudit(ai)
+      case 451:        // getaudit_addr
+      case 452:        // setaudit_addr
+      case 453:        // auditctl(path)
+        ax = 0xFFB;    // audit stub — return 0
+        break;
       case 362:
         ax = 0xFE2;
         break;  // kqueue
@@ -10195,6 +10278,10 @@ void OpSyscall(P) {
     SYSCALL(2, 0xFF5, "fbsd_getloginclass", SysFreeBSDGetloginclass, STRACE_2);
     SYSCALL(1, 0xFF6, "fbsd_setloginclass", SysFreeBSDSetloginclass, STRACE_1);
     SYSCALL(1, 0xFF7, "fbsd_setfib", SysFreeBSDSetfib, STRACE_1);
+    SYSCALL(0, 0xFF8, "fbsd_getdtablesize", SysFreeBSDGetdtablesize, STRACE_0);
+    SYSCALL(3, 0xFF9, "fbsd_setpriority", SysFreeBSDSetpriority, STRACE_3);
+    SYSCALL(2, 0xFFA, "fbsd_getpriority", SysFreeBSDGetpriority, STRACE_2);
+    SYSCALL(0, 0xFFB, "fbsd_audit_stub", SysFreeBSDAuditStub, STRACE_0);
     // Linux xattr family (0xbc..0xc7)
     SYSCALL(5, 0x0BC, "setxattr", SysSetxattr, STRACE_5);
     SYSCALL(5, 0x0BD, "lsetxattr", SysLsetxattr, STRACE_5);
