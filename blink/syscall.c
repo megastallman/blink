@@ -235,6 +235,16 @@ const char *GetDirFildesPath(struct System *s, int fildes) {
 void SignalActor(struct Machine *m) {
   for (;;) {
     STATISTIC(++interps);
+    // FreeBSD signal trampoline intercept — mirrors ExecuteInstruction.
+    // SignalActor is used for *recursive* signal delivery (called from
+    // CheckInterrupt when a host syscall returns EINTR). Without this
+    // check, when the FreeBSD handler returns to 0x7fff0000 the dispatcher
+    // tries to fetch an instruction there and segfaults.
+    if (m->system->sigtramp && m->ip == m->system->sigtramp) {
+      SigRestore(m);
+      if (m->restored) break;
+      continue;
+    }
     JitlessDispatch(DISPATCH_NOTHING);
     if (atomic_load_explicit(&m->attention, memory_order_acquire)) {
       if (m->restored) break;
@@ -4111,9 +4121,6 @@ static int SysExecve(struct Machine *m, i64 pa, i64 aa, i64 ea) {
   if (!(prog = CopyStr(m, pa))) return -1;
   if (!(argv = CopyStrList(m, aa))) return -1;
   if (!(envp = CopyStrList(m, ea))) return -1;
-  //fprintf(stderr, "execve(%s", prog);
-  //for (int i = 0; argv[i]; i++) fprintf(stderr, " %s", argv[i]);
-  //fprintf(stderr, ") pid=%d\n", m->system->pid);
   LOCK(&m->system->exec_lock);
   ExecveBlink(m, prog, argv, envp);
   SYS_LOGF("execve(%s)", prog);
@@ -9030,6 +9037,38 @@ static int SysFreeBSDSysctlbyname(struct Machine* m, i64 nameaddr,
       }
       return 0;
     }
+    // Common knobs servers probe at startup. Return plausible defaults so
+    // the guest's sizing/heuristics get a sane value rather than ENOENT.
+    {
+      u32 val32 = 0;
+      bool handled = true;
+      if (!strcmp(buf, "machdep.hlt_logical_cpus")) {
+        val32 = 0;  // we don't expose hlt-halts-logical-cpu semantics
+      } else if (!strcmp(buf, "net.inet.tcp.sendspace")) {
+        val32 = 32768;  // FreeBSD default
+      } else if (!strcmp(buf, "net.inet.tcp.recvspace")) {
+        val32 = 65536;  // FreeBSD default
+      } else if (!strcmp(buf, "kern.ipc.somaxconn")) {
+        val32 = 128;  // FreeBSD default listen queue
+      } else if (!strcmp(buf, "kern.ipc.maxsockbuf")) {
+        val32 = 2097152;  // ~2 MiB, FreeBSD default
+      } else if (!strcmp(buf, "machdep.smp_active")) {
+        val32 = 0;  // single-threaded view
+      } else if (!strcmp(buf, "kern.smp.cpus")) {
+        val32 = 1;
+      } else {
+        handled = false;
+      }
+      if (handled) {
+        if (oldaddr && CopyToUserWrite(m, oldaddr, &val32, sizeof(val32)) == -1)
+          return -1;
+        if (oldlenaddr) {
+          u64 len = sizeof(val32);
+          if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+        }
+        return 0;
+      }
+    }
     fprintf(stderr, "missing freebsd sysctlbyname: %s\n", buf);
     return enoent();
   }
@@ -9540,6 +9579,7 @@ void OpSyscall(P) {
       case 340:
         ax = 0x0ED;
         break;  // sigprocmask
+      case 341: ax = 0x200; break;  // sigsuspend
       case 342:
         ax = 0x1FB;
         break;  // __sys_sigaction
@@ -9765,9 +9805,23 @@ void OpSyscall(P) {
       case 512:
         ax = 0x1F;
         break;  // shmctl
-      case 513:
+      case 191:  // pathconf(path, name)
+      case 192:  // fpathconf(fd, name)
+      case 513:  // lpathconf(link, name)
+        // All three answer (something, name) — the handler only reads
+        // `name` from %rsi and returns sensible defaults, so the same
+        // stub serves all three.
         ax = 0xFE1;
-        break;  // lpathconf
+        break;
+      case 310:        // getsid(pid)
+        ax = 0x07C;    // Linux getsid
+        break;
+      case 311:        // setresuid(ruid, euid, suid)
+        ax = 0x075;    // Linux setresuid
+        break;
+      case 312:        // setresgid(rgid, egid, sgid)
+        ax = 0x077;    // Linux setresgid
+        break;
       case 362:
         ax = 0xFE2;
         break;  // kqueue

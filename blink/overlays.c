@@ -244,6 +244,18 @@ int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
     if (errno != ENOENT && errno != ENOTDIR) return -1;
     // fall through to normal overlay search if host doesn't have it
   }
+  // Standard character devices (/dev/null, /dev/zero, /dev/random, ...) are
+  // always satisfied from the host — the kernel's char devices have no
+  // useful in-chroot equivalent. Going through the overlay first is not
+  // just wasteful: a read-only /dev in the chroot makes openat() return
+  // EACCES (not ENOENT) for shell redirections like `>/dev/null` that
+  // carry O_CREAT, which would bypass the ENOENT-only fallback at the
+  // bottom. pkg PRE-INSTALL scripts hit this.
+  if (IsStandardDevice(path)) {
+    if ((fd = open(path, flags, mode)) != -1) return fd;
+    if (errno != ENOENT && errno != ENOTDIR) return -1;
+    // fall through to normal overlay search if host doesn't have it
+  }
   for (i = 0; g_overlays[i]; ++i) {
     if (!*g_overlays[i]) {
       if ((fd = open(path, flags, mode)) != -1) {
