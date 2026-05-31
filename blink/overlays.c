@@ -20,9 +20,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include "blink/assert.h"
@@ -85,6 +87,78 @@ static const char *RelativizePath(const char *path) {
   while (*path == '/') ++path;
   return *path ? path : ".";
 }
+
+// blink confines guests with overlays (openat relative to the overlay dir)
+// rather than a real chroot(), so the host kernel resolves an absolute
+// symlink TARGET against the host root and escapes the overlay — e.g. a guest
+// /usr/local/www/nginx -> /usr/local/www/nginx-dist symlink can't be followed.
+// openat2(RESOLVE_IN_ROOT) makes "/" and absolute symlinks resolve relative to
+// the overlay dir, exactly like chroot. We use it only as a fallback when the
+// plain openat path fails with ENOENT/ENOTDIR (the escape symptom), so the
+// common case keeps its existing behavior.
+#if defined(__linux__) && defined(SYS_openat2)
+#include <linux/openat2.h>
+#ifndef RESOLVE_IN_ROOT
+#define RESOLVE_IN_ROOT 0x10
+#endif
+#define HAVE_HOST_OPENAT2 1
+
+static int g_openat2_broken;
+
+static int OpenInRoot(int rootfd, const char *relpath, int flags, int mode) {
+  int fd;
+  struct open_how how;
+  if (g_openat2_broken) {
+    errno = ENOSYS;
+    return -1;
+  }
+  memset(&how, 0, sizeof(how));
+  how.flags = (unsigned)flags;
+  how.mode = (flags & (O_CREAT | O_TMPFILE)) ? (unsigned)mode : 0;
+  how.resolve = RESOLVE_IN_ROOT;
+  fd = (int)syscall(SYS_openat2, rootfd, relpath, &how, sizeof(how));
+  if (fd == -1 && errno == ENOSYS) g_openat2_broken = 1;
+  return fd;
+}
+
+// Resolve the parent directory of relpath within the overlay root and write
+// its real host path to out[]; *base points at the final path component.
+// Intermediate absolute symlinks are resolved in-root; the final component is
+// left for the caller's operation so its follow/create semantics are kept.
+static int ResolveParentInRoot(int rootfd, const char *relpath, char *out,
+                               size_t outsz, const char **base) {
+  int pfd;
+  ssize_t n;
+  char dirbuf[PATH_MAX];
+  char procpath[64];
+  const char *slash = strrchr(relpath, '/');
+  if (slash) {
+    size_t dlen = (size_t)(slash - relpath);
+    if (dlen == 0) dlen = 1;  // a leading-slash leftover; treat as root
+    if (dlen >= sizeof(dirbuf)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    memcpy(dirbuf, relpath, dlen);
+    dirbuf[dlen] = 0;
+    *base = slash + 1;
+  } else {
+    dirbuf[0] = '.';
+    dirbuf[1] = 0;
+    *base = relpath;
+  }
+  if ((pfd = OpenInRoot(rootfd, dirbuf, O_PATH | O_DIRECTORY | O_CLOEXEC, 0)) ==
+      -1) {
+    return -1;
+  }
+  snprintf(procpath, sizeof(procpath), "/proc/self/fd/%d", pfd);
+  n = readlink(procpath, out, outsz - 1);
+  close(pfd);
+  if (n == -1) return -1;
+  out[n] = 0;
+  return 0;
+}
+#endif /* __linux__ && SYS_openat2 */
 
 // if the user only specified a single overlay, then we treat it as
 // chroot would unless of course the specified root is the real one
@@ -277,7 +351,19 @@ int OverlaysOpen(int dirfd, const char *path, int flags, int mode) {
           continue;
         }
       }
-      if ((fd = openat(dirfd, RelativizePath(path), flags, mode)) != -1) {
+      fd = openat(dirfd, RelativizePath(path), flags, mode);
+#ifdef HAVE_HOST_OPENAT2
+      // The plain openat above can't follow an absolute symlink target back
+      // into the overlay. Retry in-root so e.g. a /www -> /www-dist symlink
+      // resolves within the chroot instead of escaping to the host root.
+      if (fd == -1 && (errno == ENOENT || errno == ENOTDIR)) {
+        int saved = errno;
+        if ((fd = OpenInRoot(dirfd, RelativizePath(path), flags, mode)) == -1) {
+          errno = saved;  // keep openat's errno so the overlay loop is unchanged
+        }
+      }
+#endif
+      if (fd != -1) {
         unassert(dup2(fd, dirfd) == dirfd);
         if (flags & O_CLOEXEC) {
           unassert(!fcntl(dirfd, F_SETFD, FD_CLOEXEC));
@@ -336,7 +422,33 @@ static ssize_t OverlaysGeneric(int dirfd, const char *path, void *args,
           continue;
         }
       }
-      if ((rc = fgenericat(dirfd, RelativizePath(path), args)) != -1) {
+      rc = fgenericat(dirfd, RelativizePath(path), args);
+#ifdef HAVE_HOST_OPENAT2
+      // Same absolute-symlink-escape fallback as OverlaysOpen: resolve the
+      // path's parent within the overlay root, then retry on the resulting
+      // host path so an intermediate /a -> /b symlink stays inside the chroot.
+      if (rc == -1 && (errno == ENOENT || errno == ENOTDIR)) {
+        int saved = errno;
+        char hostparent[PATH_MAX], hostpath[PATH_MAX];
+        const char *base;
+        if (ResolveParentInRoot(dirfd, RelativizePath(path), hostparent,
+                                sizeof(hostparent), &base) != -1) {
+          size_t pl = strlen(hostparent), bl = strlen(base);
+          if (pl + 1 + bl + 1 <= sizeof(hostpath)) {
+            memcpy(hostpath, hostparent, pl);
+            if (bl) {
+              hostpath[pl] = '/';
+              memcpy(hostpath + pl + 1, base, bl + 1);
+            } else {
+              hostpath[pl] = 0;
+            }
+            rc = fgenericat(AT_FDCWD, hostpath, args);
+          }
+        }
+        if (rc == -1) errno = saved;
+      }
+#endif
+      if (rc != -1) {
         unassert(!close(dirfd));
         return rc;
       }
