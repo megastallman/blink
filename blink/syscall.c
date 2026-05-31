@@ -4674,11 +4674,16 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
     if (m->system->isfreebsd) {
       // FreeBSD sigaltstack: {ss_sp[8], ss_size[8], ss_flags[4], pad[4]}
       // Linux sigaltstack:   {ss_sp[8], ss_flags[4], pad[4], ss_size[8]}
-      // Convert FreeBSD layout to Linux layout
+      // Convert FreeBSD layout AND flag values to Linux's.
+      // FreeBSD: SS_ONSTACK=0x1, SS_DISABLE=0x4
+      // Linux:   SS_ONSTACK=0x1, SS_DISABLE=0x2
       memcpy(converted.sp, ss->sp, 8);           // sp is at same offset
       u64 fbsd_size = Read64(ss->flags);          // FreeBSD size at offset 8
       u32 fbsd_flags = Read32(ss->size);          // FreeBSD flags at offset 16
-      Write32(converted.flags, fbsd_flags);
+      u32 lin_flags = 0;
+      if (fbsd_flags & 0x1) lin_flags |= SS_ONSTACK_LINUX;
+      if (fbsd_flags & 0x4) lin_flags |= SS_DISABLE_LINUX;
+      Write32(converted.flags, lin_flags);
       memset(converted.pad1_, 0, 4);
       Write64(converted.size, fbsd_size);
       ss = &converted;
@@ -4698,7 +4703,7 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
         LOGF("sigaltstack ss_sp=%#" PRIx64 " ss_size=%#" PRIx64
              " didn't exist with read+write permission",
              Read64(ss->sp), Read64(ss->size));
-        return -1;
+        return einval();
       }
     }
   }
@@ -4710,11 +4715,15 @@ static int SysSigaltstack(struct Machine *m, i64 newaddr, i64 oldaddr) {
               Read32(m->sigaltstack.flags) | SS_ONSTACK_LINUX);
     }
     if (m->system->isfreebsd) {
-      // Convert Linux layout back to FreeBSD layout for the guest
+      // Convert Linux layout AND flag values back to FreeBSD's for the guest.
       u8 fbsd_ss[24];
+      u32 lin_flags = Read32(m->sigaltstack.flags);
+      u32 fbsd_flags = 0;
+      if (lin_flags & SS_ONSTACK_LINUX) fbsd_flags |= 0x1;
+      if (lin_flags & SS_DISABLE_LINUX) fbsd_flags |= 0x4;
       memcpy(fbsd_ss, m->sigaltstack.sp, 8);              // sp at offset 0
       Write64(fbsd_ss + 8, Read64(m->sigaltstack.size));   // size at offset 8
-      Write32(fbsd_ss + 16, Read32(m->sigaltstack.flags)); // flags at offset 16
+      Write32(fbsd_ss + 16, fbsd_flags);                   // flags at offset 16
       Write32(fbsd_ss + 20, 0);                            // padding
       CopyToUserWrite(m, oldaddr, fbsd_ss, 24);
     } else {
@@ -7346,9 +7355,16 @@ static int SysFreeBSD_umtx_op(struct Machine *m, i64 obj, int op, u64 val,
       u8 *mem = LookupAddress(m, obj);
       if (!mem) return efault();
       u32 curval = Load32(mem);
-      if (curval != (u32)val) return eagain();
+      // FreeBSD: when *addr != val the kernel does NOT sleep and returns 0
+      // (success), unlike Linux futex which returns EAGAIN. Go's
+      // futexsleep1 deliberately crashes on any unexpected error, so we
+      // must return 0 here rather than EAGAIN.
+      if (curval != (u32)val) return 0;
       if (IsOrphan(m)) { Store32(mem, 0); return 0; }
-      return SysFutexWait(m, obj, FUTEX_WAIT_LINUX, val, 0);
+      int rc = SysFutexWait(m, obj, FUTEX_WAIT_LINUX, val, 0);
+      // Same rationale for the TOCTOU re-check inside SysFutexWait.
+      if (rc == -1 && errno == EAGAIN) return 0;
+      return rc;
     }
     case 3:   // UMTX_OP_WAKE
     case 16:  // UMTX_OP_WAKE_PRIVATE
@@ -7686,20 +7702,18 @@ static int SysFreeBSDFutimens(struct Machine *m, i32 fd, i64 tvsaddr) {
   return SysUtimensat(m, fd, 0, tvsaddr, 0);
 }
 
-// FreeBSD cpuset_getaffinity: report 1 CPU available
+// FreeBSD cpuset_getaffinity: report a single CPU available.
+// blink's multi-threaded SMP emulation intermittently corrupts guest runtime
+// state once a program (e.g. Go) schedules across more than one CPU, so we
+// pin guests to one CPU until that cross-thread coherence bug is fixed.
 static int SysFreeBSDCpusetGetaffinity(struct Machine *m) {
   i64 setsize = Get64(m->r10);
   i64 mask_addr = Get64(m->r8);
   u8 *mask;
-  int ncpus;
   if (setsize <= 0 || !mask_addr) return einval();
   if (!(mask = (u8 *)SchlepW(m, mask_addr, setsize))) return -1;
   memset(mask, 0, setsize);
-  ncpus = GetCpuCount();
-  if (ncpus < 1) ncpus = 1;
-  for (int i = 0; i < ncpus && i < (int)(setsize * 8); ++i) {
-    mask[i / 8] |= 1 << (i % 8);
-  }
+  mask[0] |= 1;  // CPU 0 only
   return 0;
 }
 
@@ -8554,6 +8568,9 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
           case 33: sname = "kern.usrstack"; break;
           case 37: sname = "kern.arnd"; break;
           case 200: sname = "kern.boottrace.enabled"; break;
+          case 201: sname = "kern.smp.maxcpus"; break;
+          case 202: sname = "kern.conftxt"; break;
+          case 203: sname = "kern.ipc.soacceptqueue"; break;
         }
       } else if (oid0 == 6) {
         switch (oid1) {
@@ -8622,6 +8639,16 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       } else if (!strcmp(buf, "kern.boottrace.enabled")) {
         oid[0] = 1;
         oid[1] = 200;  // synthetic OID for boottrace.enabled
+      } else if (!strcmp(buf, "kern.smp.maxcpus")) {
+        oid[0] = 1;
+        oid[1] = 201;  // synthetic OID for smp.maxcpus
+      } else if (!strcmp(buf, "kern.conftxt")) {
+        oid[0] = 1;
+        oid[1] = 202;  // synthetic OID for conftxt
+      } else if (!strcmp(buf, "kern.ipc.soacceptqueue") ||
+                 !strcmp(buf, "kern.ipc.somaxconn")) {
+        oid[0] = 1;
+        oid[1] = 203;  // synthetic OID for soacceptqueue (listen backlog max)
       } else {
         fprintf(stderr, "missing freebsd sysctl name2oid: %s\n", buf);
         return enoent();
@@ -8650,6 +8677,7 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
           case 4:  /* KERN_VERSION */
           case 10: /* KERN_HOSTNAME */
           case 22: /* KERN_DOMAINNAME */
+          case 202: /* kern.conftxt (synthetic) */
             kind = 0x80000003; /* CTLFLAG_RD | CTLTYPE_STRING */
             fmt = "A";
             break;
@@ -8892,6 +8920,41 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       }
       return 0;
     }
+    if (name[1] == 201 /* synthetic: kern.smp.maxcpus */) {
+      // Report a single CPU. blink's multi-threaded SMP emulation has a
+      // cross-thread memory-coherence bug that intermittently corrupts the
+      // Go runtime's lock counters ("schedule: holding locks") once Go runs
+      // with more than one P. Until that is fixed, keep guests single-core:
+      // Go's getCPUCount() reads this to size its cpuset affinity buffer and
+      // then counts the bits cpuset_getaffinity returns (also 1).
+      u32 val = 1;
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
+      if (oldlenaddr) {
+        u64 len = 4;
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      }
+      return 0;
+    }
+    if (name[1] == 202 /* synthetic: kern.conftxt */) {
+      // Go's routebsd reads the "machine <arch>" line to pick the routing
+      // message ABI alignment. Provide a minimal config naming the arch.
+      static const char conftxt[] = "machine amd64\nident GENERIC\n";
+      u64 slen = sizeof(conftxt);  // includes NUL
+      if (oldaddr && CopyToUserWrite(m, oldaddr, conftxt, slen) == -1) return -1;
+      if (oldlenaddr) {
+        if (CopyToUserWrite(m, oldlenaddr, &slen, 8) == -1) return -1;
+      }
+      return 0;
+    }
+    if (name[1] == 203 /* synthetic: kern.ipc.soacceptqueue */) {
+      u32 val = 128;  // SOMAXCONN: max listen backlog
+      if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
+      if (oldlenaddr) {
+        u64 len = 4;
+        if (CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      }
+      return 0;
+    }
   } else if (name[0] == 6 /* CTL_HW */) {
     if (name[1] == 1 /* HW_MACHINE */) {
       if (oldaddr && CopyToUserWrite(m, oldaddr, "amd64", 6) == -1) return -1;
@@ -8913,7 +8976,7 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       return 0;
     }
     if (name[1] == 3 /* HW_NCPU */) {
-      u32 ncpu = 1;
+      u32 ncpu = 1;  // single-core; see kern.smp.maxcpus note above
       if (oldaddr && CopyToUserWrite(m, oldaddr, &ncpu, 4) == -1) return -1;
       if (oldlenaddr) {
         u64 len = 4;
@@ -9037,6 +9100,13 @@ static int SysFreeBSDSysctlbyname(struct Machine* m, i64 nameaddr,
     mib[0] = 1; mib[1] = 26;
   } else if (!strcmp(buf, "kern.boottrace.enabled")) {
     mib[0] = 1; mib[1] = 200;
+  } else if (!strcmp(buf, "kern.smp.maxcpus")) {
+    mib[0] = 1; mib[1] = 201;
+  } else if (!strcmp(buf, "kern.conftxt")) {
+    mib[0] = 1; mib[1] = 202;
+  } else if (!strcmp(buf, "kern.ipc.soacceptqueue") ||
+             !strcmp(buf, "kern.ipc.somaxconn")) {
+    mib[0] = 1; mib[1] = 203;
   } else if (!strcmp(buf, "security.jail.jailed")) {
     // Return 0 (not jailed)
     u32 val = 0;
@@ -9307,8 +9377,13 @@ void OpSyscall(P) {
         goto freebsd_translate;
       }
       case 1:
-        ax = 0x3c;
-        break;  // exit
+        // FreeBSD exit(2) terminates the ENTIRE process (all threads), like
+        // Linux exit_group(2). Per-thread exit on FreeBSD is thr_exit(431).
+        // Mapping to Linux exit (0x3c) would only pthread_exit the calling
+        // thread, hanging the process when other runtime threads are alive
+        // (e.g. Go's sysmon/GC). Map to exit_group instead.
+        ax = 0xe7;
+        break;  // exit → exit_group (whole-process termination)
       case 2:
         ax = 0x39;
         break;  // fork
@@ -9689,6 +9764,19 @@ void OpSyscall(P) {
       case 30:
         ax = 0x2B;
         break;  // accept
+      case 541: {
+        // accept4(s, addr, addrlen, flags): translate FreeBSD socket flags
+        // (SOCK_CLOEXEC=0x10000000, SOCK_NONBLOCK=0x20000000) in the flags
+        // arg (r10) to Linux (SOCK_CLOEXEC_LINUX, SOCK_NONBLOCK_LINUX);
+        // SysAccept4 rejects any unknown flag bits.
+        u64 bsd_flags = Get64(m->r10);
+        u64 linux_flags = 0;
+        if (bsd_flags & 0x10000000) linux_flags |= SOCK_CLOEXEC_LINUX;
+        if (bsd_flags & 0x20000000) linux_flags |= SOCK_NONBLOCK_LINUX;
+        Put64(m->r10, linux_flags);
+        ax = 0x120;  // Linux accept4
+        break;
+      }
       case 104:
         ax = 0x31;
         break;  // bind
@@ -9912,6 +10000,9 @@ void OpSyscall(P) {
       case 453:        // auditctl(path)
         ax = 0xFFB;    // audit stub — return 0
         break;
+      case 331:
+        ax = 0x018;
+        break;  // sched_yield
       case 362:
         ax = 0xFE2;
         break;  // kqueue
