@@ -166,9 +166,9 @@ struct HostPage {
 };
 
 struct HostPages {
-  size_t n;
-  size_t c;
-  u8 **p;
+  size_t n;                 // [guarded by g_hostpages_lock]
+  size_t c;                 // [guarded by g_hostpages_lock]
+  _Atomicish(u8 **) p;      // published w/ release; read lock-free by FindHostPage
 };
 
 struct PageLock {
@@ -848,7 +848,11 @@ static inline u8 *FindHostPage(u64 entry) {
   if (HasLinearMapping()) {
     return (u8 *)(uintptr_t)(entry & PAGE_TA);
   } else {
-    return g_hostpages.p[(entry & PAGE_TA) >> 12];
+    // Lock-free read of the g_hostpages array. TrackHostPage() publishes the
+    // (possibly grown) array pointer with release ordering and never frees old
+    // arrays, so this acquire load always yields an array containing our entry.
+    return atomic_load_explicit(&g_hostpages.p, memory_order_acquire)
+        [(entry & PAGE_TA) >> 12];
   }
 }
 

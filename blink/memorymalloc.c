@@ -52,6 +52,7 @@ struct Allocator {
 
 struct Machine g_bssmachine;
 struct HostPages g_hostpages;
+static pthread_mutex_t_ g_hostpages_lock = PTHREAD_MUTEX_INITIALIZER_;
 
 static void FillPage(void *p, int c) {
   memset(p, c, 4096);
@@ -69,21 +70,36 @@ static void FreeHostPage(struct HostPage *hp) {
   free(hp);
 }
 
+// Records a host page pointer in the global g_hostpages table and returns the
+// (index << 12) cookie that gets stored in a PTE's PAGE_TA bits, so the page
+// can later be resolved by FindHostPage(). Thread-safe: page faults on
+// different guest threads call this concurrently (-m mode). The matching
+// reader, FindHostPage(), is lock-free, so on growth we publish the new array
+// with release ordering and intentionally do NOT free the old one (a reader
+// may still hold it); the old arrays are reclaimed at process exit. Growth is
+// rare (geometric), so the leaked arrays are negligible.
 static u64 TrackHostPage(u8 *ptr) {
   u64 entry;
+  u8 **p;
   if (HasLinearMapping()) {
     return (uintptr_t)ptr;
-  } else {
-    if (g_hostpages.n == g_hostpages.c) {
-      g_hostpages.c += 1;
-      g_hostpages.c += g_hostpages.c >> 1;
-      g_hostpages.p =
-          realloc(g_hostpages.p, g_hostpages.c * sizeof(*g_hostpages.p));
-    }
-    entry = g_hostpages.n++;
-    g_hostpages.p[entry] = ptr;
-    return entry << 12;
   }
+  LOCK(&g_hostpages_lock);
+  p = atomic_load_explicit(&g_hostpages.p, memory_order_relaxed);
+  if (g_hostpages.n == g_hostpages.c) {
+    size_t nc = g_hostpages.c + (g_hostpages.c >> 1) + 16;
+    u8 **np = (u8 **)malloc(nc * sizeof(*np));
+    unassert(np);
+    if (g_hostpages.n) memcpy(np, p, g_hostpages.n * sizeof(*np));
+    atomic_store_explicit(&g_hostpages.p, np, memory_order_release);
+    g_hostpages.c = nc;
+    p = np;
+  }
+  entry = g_hostpages.n;
+  p[entry] = ptr;
+  g_hostpages.n = entry + 1;
+  UNLOCK(&g_hostpages_lock);
+  return entry << 12;
 }
 
 void FreeAnonymousPage(struct System *s, u8 *page) {

@@ -7833,7 +7833,13 @@ static int SysFreeBSDCpusetGetaffinity(struct Machine *m) {
   if (setsize <= 0 || !mask_addr) return einval();
   if (!(mask = (u8 *)SchlepW(m, mask_addr, setsize))) return -1;
   memset(mask, 0, setsize);
-  mask[0] |= 1;  // CPU 0 only
+  {
+    int ncpus = GetCpuCount();
+    if (ncpus < 1) ncpus = 1;
+    for (int i = 0; i < ncpus && i < (int)(setsize * 8); ++i) {
+      mask[i / 8] |= 1 << (i % 8);
+    }
+  }
   return 0;
 }
 
@@ -9059,14 +9065,14 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       return 0;
     }
     if (name[1] == 201 /* synthetic: kern.smp.maxcpus */) {
-      // Report a single CPU. blink's multi-threaded SMP emulation still has a
-      // residual corruption bug under allocation/GC-heavy workloads (crashes
-      // in runtime heap-bitmap init), so keep guests single-core for now. A
-      // major contributor — an out-of-bounds thr_exit-thunk write in thr_new —
-      // was fixed (see SysFreeBSDThrNew); the GC-path bug remains. Go's
-      // getCPUCount() reads this to size its cpuset affinity buffer and then
-      // counts the bits cpuset_getaffinity returns (also 1).
-      u32 val = 1;
+      // Report the host CPU count. Guests were formerly pinned to 1 CPU to
+      // dodge SMP corruption that turned out to be three -m/thread bugs (an
+      // out-of-bounds thr_exit-thunk write in thr_new, an unlocked g_hostpages
+      // table, and a bogus free on the page-fault CAS-loss path) — all fixed.
+      // Go's getCPUCount() reads this to size its cpuset affinity buffer, then
+      // counts the bits cpuset_getaffinity returns.
+      u32 val = (u32)GetCpuCount();
+      if (val < 1) val = 1;
       if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
       if (oldlenaddr) {
         u64 len = 4;
@@ -9115,7 +9121,8 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       return 0;
     }
     if (name[1] == 3 /* HW_NCPU */) {
-      u32 ncpu = 1;  // single-core; see kern.smp.maxcpus note above
+      u32 ncpu = (u32)GetCpuCount();  // see kern.smp.maxcpus note above
+      if (ncpu < 1) ncpu = 1;
       if (oldaddr && CopyToUserWrite(m, oldaddr, &ncpu, 4) == -1) return -1;
       if (oldlenaddr) {
         u64 len = 4;
