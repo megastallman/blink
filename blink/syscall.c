@@ -7693,16 +7693,26 @@ static int SysFreeBSDThrNew(struct Machine *m) {
   m2->ip = start_func;      // start executing at start_func
   Put64(m2->di, arg);        // first argument
   Put64(m2->ax, 0);
-  // Stack grows down; align to 16, then subtract 8 to simulate
-  // the return address pushed by a CALL instruction (ABI: RSP%16==8).
-  // Write the thr_exit thunk as the return address so that when
-  // start_func returns, the thread cleanly calls thr_exit(0).
-  u64 sp = (stack_base + stack_size) & ~(u64)15;
-  sp -= 8;
+  // Lay out the top of the child's g0 stack. Everything we write MUST stay
+  // within [stack_base, stack_base+stack_size): the thr_exit thunk and the
+  // return-address slot live just below the (16-aligned) stack top, NOT at it.
+  // An earlier version put the 11-byte thunk at `top` itself (thunk_addr =
+  // sp + 8 where sp = top - 8), writing up to ~11 bytes PAST stack.hi into
+  // whatever guest memory happened to be adjacent (often another M's data or
+  // a sudog) — silently corrupting the Go runtime on EVERY thread creation.
+  // That was the long-standing "schedule: holding locks" / "sudog with non-nil
+  // next" SMP bug. Linux clone() writes no such thunk, which is why only
+  // FreeBSD Go programs hit it. See memory: go_freebsd_support.md.
+  //
+  //   top        = (stack_base+stack_size) & ~15   (16-aligned, == stack.hi)
+  //   thunk_addr = top - 16   -> thunk occupies [top-16, top-6)  (in-bounds)
+  //   sp         = top - 24   -> return slot [top-24, top-16); sp%16 == 8
+  // When start_func returns it pops thunk_addr and jumps to the thunk, which
+  // cleanly calls thr_exit(0) instead of returning to address 0.
+  u64 top = (stack_base + stack_size) & ~(u64)15;
+  u64 thunk_addr = top - 16;
+  u64 sp = top - 24;  // ABI: (RSP%16)==8 at the callee's first instruction
   Put64(m2->sp, sp);
-  // Write a thr_exit(0) thunk at the top of the stack and set the return
-  // address to point to it. When start_func returns, the thread will
-  // cleanly call thr_exit(0) instead of jumping to address 0.
   {
     // x86-64 code: xor %edi,%edi; mov $431,%eax; syscall; ud2
     static const u8 code[] = {
@@ -7711,7 +7721,6 @@ static int SysFreeBSDThrNew(struct Machine *m) {
         0x0f, 0x05,                    // syscall
         0x0f, 0x0b,                    // ud2
     };
-    u64 thunk_addr = sp + 8;  // just above the return address slot
     u8 *thunk_mem = (u8 *)LookupAddress(m, thunk_addr);
     u8 *ret_mem = (u8 *)LookupAddress(m, sp);
     if (thunk_mem && ret_mem) {
@@ -9050,12 +9059,13 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
       return 0;
     }
     if (name[1] == 201 /* synthetic: kern.smp.maxcpus */) {
-      // Report a single CPU. blink's multi-threaded SMP emulation has a
-      // cross-thread memory-coherence bug that intermittently corrupts the
-      // Go runtime's lock counters ("schedule: holding locks") once Go runs
-      // with more than one P. Until that is fixed, keep guests single-core:
-      // Go's getCPUCount() reads this to size its cpuset affinity buffer and
-      // then counts the bits cpuset_getaffinity returns (also 1).
+      // Report a single CPU. blink's multi-threaded SMP emulation still has a
+      // residual corruption bug under allocation/GC-heavy workloads (crashes
+      // in runtime heap-bitmap init), so keep guests single-core for now. A
+      // major contributor — an out-of-bounds thr_exit-thunk write in thr_new —
+      // was fixed (see SysFreeBSDThrNew); the GC-path bug remains. Go's
+      // getCPUCount() reads this to size its cpuset affinity buffer and then
+      // counts the bits cpuset_getaffinity returns (also 1).
       u32 val = 1;
       if (oldaddr && CopyToUserWrite(m, oldaddr, &val, 4) == -1) return -1;
       if (oldlenaddr) {
