@@ -2949,6 +2949,117 @@ OnFailure:
   }
 }
 
+// Write a guest iovec array to socket s, accumulating bytes into *total.
+// Returns 0 on success, -1 on error (errno set; *total reflects bytes that
+// did make it out, so callers can report partial progress on EAGAIN).
+static int FreeBSDSendIovecs(struct Machine *m, int s, u64 iov_addr,
+                             int iovcnt, i64 *total) {
+  for (int i = 0; i < iovcnt; i++) {
+    u8 iovbuf[16];
+    if (CopyFromUserRead(m, iovbuf, (i64)iov_addr + (i64)i * 16, 16) == -1) {
+      return -1;
+    }
+    u64 base = Read64(iovbuf);
+    u64 len = Read64(iovbuf + 8);
+    u64 off = 0;
+    while (off < len) {
+      size_t chunk = (size_t)MIN(len - off, (u64)65536);
+      const u8 *p = (const u8 *)SchlepR(m, (i64)(base + off), chunk);
+      if (!p) return -1;
+      ssize_t w = VfsWrite(s, p, chunk);
+      if (w == -1) return -1;
+      off += (u64)w;
+      *total += w;
+    }
+  }
+  return 0;
+}
+
+// FreeBSD sendfile(fd, s, offset, nbytes, hdtr, sbytes, flags):
+//   fd     = source file, s = destination socket (note: opposite of Linux)
+//   nbytes = file bytes to send (0 = to EOF); headers/trailers sent in addition
+//   hdtr   = struct sf_hdtr {iovec *headers; int hdr_cnt; iovec *trailers;
+//            int trl_cnt;} (32 bytes), or NULL
+//   sbytes = out: total bytes sent (headers + file + trailers), or NULL
+//   flags  = SF_* hints (ignored)
+// Returns 0 on success, -1 on error. On a non-blocking socket a short write
+// yields -1/EAGAIN with *sbytes set to what was sent — nginx waits for
+// EVFILT_WRITE and resumes from there, so partial progress must be reported.
+static int SysFreeBSDSendfile(struct Machine *m, i32 fd, i32 s, i64 offset,
+                              u64 nbytes, i64 hdtr_addr, i64 sbytes_addr) {
+  i64 total = 0;
+  int ret = 0;
+  int saved_errno = 0;
+  u64 headers = 0, trailers = 0;
+  i32 hdr_cnt = 0, trl_cnt = 0;
+  if (CheckFdAccess(m, s, true, EBADF) == -1) return -1;
+  if (CheckFdAccess(m, fd, false, EBADF) == -1) return -1;
+  if (offset < 0) return einval();
+  if (hdtr_addr) {
+    u8 hd[32];
+    if (CopyFromUserRead(m, hd, hdtr_addr, 32) == -1) return -1;
+    headers = Read64(hd + 0);
+    hdr_cnt = (i32)Read32(hd + 8);
+    trailers = Read64(hd + 16);
+    trl_cnt = (i32)Read32(hd + 24);
+  }
+  if (headers && hdr_cnt > 0) {
+    if (FreeBSDSendIovecs(m, s, headers, hdr_cnt, &total) == -1) {
+      saved_errno = errno;
+      ret = -1;
+      goto done;
+    }
+  }
+  {
+    u64 sent = 0;
+    bool until_eof = (nbytes == 0);
+    u8 *buf;
+    size_t maxchunk = 65536;
+    if (!(buf = (u8 *)AddToFreeList(m, malloc(maxchunk)))) return -1;
+    while (until_eof || sent < nbytes) {
+      size_t chunk =
+          until_eof ? maxchunk : (size_t)MIN(nbytes - sent, (u64)maxchunk);
+      ssize_t got = VfsPread(fd, buf, chunk, offset + (i64)sent);
+      if (got == -1) {
+        saved_errno = errno;
+        ret = -1;
+        goto done;
+      }
+      if (got == 0) break;  // EOF
+      ssize_t off2 = 0;
+      while (off2 < got) {
+        ssize_t w = VfsWrite(s, buf + off2, (size_t)(got - off2));
+        if (w == -1) {
+          saved_errno = errno;
+          ret = -1;
+          goto done;
+        }
+        off2 += w;
+        total += w;
+      }
+      sent += (u64)got;
+    }
+  }
+  if (trailers && trl_cnt > 0) {
+    if (FreeBSDSendIovecs(m, s, trailers, trl_cnt, &total) == -1) {
+      saved_errno = errno;
+      ret = -1;
+      goto done;
+    }
+  }
+done:
+  if (sbytes_addr) {
+    u8 sb[8];
+    Write64(sb, (u64)total);
+    if (CopyToUserWrite(m, sbytes_addr, sb, 8) == -1) return -1;
+  }
+  if (ret == -1) {
+    errno = saved_errno;
+    return -1;
+  }
+  return 0;
+}
+
 static int UnXlatDt(int x) {
 #ifndef DT_UNKNOWN
   return DT_UNKNOWN_LINUX;
@@ -7917,6 +8028,7 @@ struct KqWatch {
   i16 filter;
   u64 udata;
   bool active;
+  bool clear;  // EV_CLEAR requested → edge-triggered (EPOLLET)
 };
 
 struct KqState {
@@ -7957,13 +8069,16 @@ static u64 FindUdata(struct KqState *kq, u64 ident, i16 filter) {
   return w ? w->udata : 0;
 }
 
-// Get combined epoll events for an fd (READ + WRITE)
+// Get combined epoll events for an fd (READ + WRITE). EV_CLEAR on any active
+// watch maps to EPOLLET so the fd is edge-triggered like kqueue — otherwise a
+// level-triggered epoll re-reports readiness forever and the guest busy-loops.
 static u32 GetCombinedEpollEvents(struct KqState *kq, u64 ident) {
   u32 events = 0;
   for (int i = 0; i < kq->nwatches; i++) {
     if (kq->watches[i].active && kq->watches[i].ident == ident) {
       if (kq->watches[i].filter == EVFILT_READ_) events |= EPOLLIN;
       if (kq->watches[i].filter == EVFILT_WRITE_) events |= EPOLLOUT;
+      if (kq->watches[i].clear) events |= EPOLLET;
     }
   }
   return events;
@@ -8045,6 +8160,7 @@ static int KqProcessChange(struct KqState *kq, u64 ident, i16 filter,
       w->active = true;
     }
     w->udata = udata;
+    w->clear = (flags & EV_CLEAR_) != 0;
     // Update epoll registration with combined events for this fd
     u32 events = GetCombinedEpollEvents(kq, ident);
     struct epoll_event ev = {0};
@@ -8094,7 +8210,7 @@ static i32 SysFreeBSDKevent(struct Machine *m, i32 kq_fd, i64 changelist_addr,
     u16 flags = Read16(kev + 10);
     u32 fflags = Read32(kev + 12);
     u64 udata = Read64(kev + 24);
-    int rc = KqProcessChange(kq, ident, filter, flags, fflags, udata);
+      int rc = KqProcessChange(kq, ident, filter, flags, fflags, udata);
     // EV_RECEIPT: return result in eventlist
     if ((flags & EV_RECEIPT_) && eventlist_addr && nevents > 0) {
       u8 out[64] = {0};
@@ -8141,6 +8257,12 @@ static i32 SysFreeBSDKevent(struct Machine *m, i32 kq_fd, i64 changelist_addr,
         Write64(kev + 0, fd);
         Write16(kev + 8, (u16)(i16)EVFILT_READ_);
         if (ev & EPOLLHUP) Write16(kev + 10, EV_EOF_);
+        // kev.data = bytes available to read. nginx (and others) use this
+        // under kqueue to size reads and track ready state; a missing value
+        // makes them stop reading. FIONREAD works for sockets and pipes.
+        int navail = 0;
+        if (ioctl((int)fd, FIONREAD, &navail) == -1) navail = 0;
+        Write64(kev + 16, (u64)(i64)navail);
         Write64(kev + 24, w->udata);
         CopyToUserWrite(m, eventlist_addr + (i64)nout * kev_size, kev, kev_size);
         nout++;
@@ -8153,6 +8275,13 @@ static i32 SysFreeBSDKevent(struct Machine *m, i32 kq_fd, i64 changelist_addr,
         Write64(kev + 0, fd);
         Write16(kev + 8, (u16)(i16)EVFILT_WRITE_);
         if (ev & EPOLLHUP) Write16(kev + 10, EV_EOF_);
+        // kev.data = free space in the send buffer for write events.
+        int sndbuf = 0;
+        socklen_t optlen = sizeof(sndbuf);
+        if (getsockopt((int)fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == -1) {
+          sndbuf = 0;
+        }
+        Write64(kev + 16, (u64)(i64)sndbuf);
         Write64(kev + 24, w->udata);
         CopyToUserWrite(m, eventlist_addr + (i64)nout * kev_size, kev, kev_size);
         nout++;
@@ -10003,6 +10132,9 @@ void OpSyscall(P) {
       case 331:
         ax = 0x018;
         break;  // sched_yield
+      case 393:
+        ax = 0xFFC;
+        break;  // sendfile (FreeBSD signature, custom handler)
       case 362:
         ax = 0xFE2;
         break;  // kqueue
@@ -10488,6 +10620,10 @@ void OpSyscall(P) {
       ax = SysFreeBSDKevent(m, di, si, dx, r0, r8, r9, 64);
       break;
 #endif
+    case 0xFFC:
+      // sendfile(fd, s, offset, nbytes, hdtr, sbytes [, flags])
+      ax = SysFreeBSDSendfile(m, di, si, dx, r0, r8, r9);
+      break;
     case 0xFE5: {
       // getfsstat(buf, bufsize, mode)
       // FreeBSD struct statfs is 2344 bytes on 64-bit

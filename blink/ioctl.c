@@ -702,6 +702,21 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
         return VfsFcntl(fildes, F_SETFL, (oflags & SETFL_FLAGS) & ~O_NDELAY);
       }
     }
+    case 0x8004667du: {  // FreeBSD FIOASYNC: enable/disable SIGIO via O_ASYNC.
+      // nginx sets this on its master<->worker channel socket while spawning
+      // workers and treats failure as fatal, so it must succeed.
+      const u8 *p;
+      int val = 0;
+      int oflags;
+      if (addr && (p = (const u8 *)SchlepR(m, addr, 4))) val = Read32(p);
+      if ((oflags = GetOflags(m, fildes)) == -1) return -1;
+      if (val) {
+        return VfsFcntl(fildes, F_SETFL, (oflags & SETFL_FLAGS) | O_ASYNC_SETFL);
+      } else {
+        return VfsFcntl(fildes, F_SETFL,
+                        (oflags & SETFL_FLAGS) & ~O_ASYNC_SETFL);
+      }
+    }
     case 0x20006601u:  // FreeBSD FIOCLEX
       return IoctlFioclex(m, fildes);
     case 0x20006602u:  // FreeBSD FIONCLEX
