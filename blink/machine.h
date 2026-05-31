@@ -340,6 +340,7 @@ struct JitPath {
   int elements;
   u64 skew;
   i64 start;
+  i64 opstart;  // host-code offset where the current op's codegen began (peephole)
   struct JitBlock *jb;
 };
 
