@@ -108,7 +108,7 @@ u64 HandlePageFault(struct Machine *m, u8 *pslot, u64 entry) {
         // (page & PAGE_TA) is the g_hostpages *index*, not the host pointer,
         // so freeing it directly poisons the allocator free list. This path
         // only triggers when two threads fault the same page concurrently.
-        FreeAnonymousPage(m->system, FindHostPage(page));
+        FreeAnonymousPage(m->system, FindHostPage(page), page & PAGE_TA);
         entry = LoadPte(pslot);
         m->system->rss -= 1;
       }

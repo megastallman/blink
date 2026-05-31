@@ -162,6 +162,7 @@ struct FreeList {
 
 struct HostPage {
   u8 *page;
+  u64 cookie;  // cached TrackHostPage() result (PAGE_TA bits) for index reuse
   struct HostPage *next;
 };
 
@@ -488,7 +489,7 @@ int LoadInstruction2(struct Machine *, u64);
 void ExecuteInstruction(struct Machine *);
 u64 AllocatePageTable(struct System *);
 u64 AllocateAnonymousPage(struct System *);
-void FreeAnonymousPage(struct System *, u8 *);
+void FreeAnonymousPage(struct System *, u8 *, u64);
 u64 FindPageTableEntry(struct Machine *, u64);
 bool CheckMemoryInvariants(struct System *) nosideeffect dontdiscard;
 i64 ReserveVirtual(struct System *, i64, i64, u64, int, i64, bool, bool);

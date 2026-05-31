@@ -102,11 +102,18 @@ static u64 TrackHostPage(u8 *ptr) {
   return entry << 12;
 }
 
-void FreeAnonymousPage(struct System *s, u8 *page) {
+// Returns a host page to the free list. `cookie` is the page's PAGE_TA bits
+// (its TrackHostPage() result, i.e. the g_hostpages index in -m mode); caching
+// it lets AllocateAnonymousPage() reuse the same g_hostpages slot instead of
+// minting a fresh one on every reallocation, which otherwise grows the table
+// without bound. Callers derive both from the freed PTE: page=FindHostPage(e),
+// cookie=(e & PAGE_TA).
+void FreeAnonymousPage(struct System *s, u8 *page, u64 cookie) {
   struct HostPage *h;
   unassert((h = NewHostPage()));
   LOCK(&g_allocator.lock);
   h->page = page;
+  h->cookie = cookie;
   h->next = g_allocator.pages;
   g_allocator.pages = h;
   UNLOCK(&g_allocator.lock);
@@ -136,8 +143,8 @@ void *AllocateBig(size_t n, int prot, int flags, int fd, off_t off) {
   return p != MAP_FAILED ? p : 0;
 }
 
-static void FreePageTable(struct System *s, u8 *page) {
-  FreeAnonymousPage(s, page);
+static void FreePageTable(struct System *s, u8 *page, u64 cookie) {
+  FreeAnonymousPage(s, page, cookie);
   s->memstat.tables -= 1;
   s->rss -= 1;
 }
@@ -146,6 +153,7 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
   u8 *mi;
   long i;
   bool isempty = true;
+  u64 selfta = pt & PAGE_TA;  // this table's own cookie (pt is reused below)
   mi = GetPageAddress(s, pt, level == 1);
   for (i = 0; i < 512; ++i) {
     if (level == 4) {
@@ -166,7 +174,7 @@ static bool FreeEmptyPageTables(struct System *s, u64 pt, long level) {
     }
   }
   if (isempty) {
-    FreePageTable(s, mi);
+    FreePageTable(s, mi, selfta);
   }
   return isempty;
 }
@@ -466,6 +474,7 @@ void FreeMachine(struct Machine *m) {
 
 u64 AllocateAnonymousPage(struct System *s) {
   u8 *page;
+  u64 cookie;
   size_t i, n;
   struct HostPage *h;
   LOCK(&g_allocator.lock);
@@ -473,6 +482,7 @@ u64 AllocateAnonymousPage(struct System *s) {
     g_allocator.pages = h->next;
     UNLOCK(&g_allocator.lock);
     page = h->page;
+    cookie = h->cookie;  // reuse the page's existing g_hostpages slot
     FreeHostPage(h);
     goto Finished;
   } else {
@@ -482,19 +492,23 @@ u64 AllocateAnonymousPage(struct System *s) {
   page = (u8 *)AllocateBig(n * 4096, PROT_READ | PROT_WRITE,
                            MAP_ANONYMOUS_ | MAP_PRIVATE, -1, 0);
   if (!page) return -1;
+  // Track all n freshly-mapped pages exactly once. The returned page keeps its
+  // cookie; the rest carry theirs on the free list, so reallocation never
+  // re-tracks (TrackHostPage is only ever called for genuinely new memory).
   LOCK(&g_allocator.lock);
   for (i = n; i-- > 1;) {
     unassert((h = NewHostPage()));
     h->page = page + i * 4096;
+    h->cookie = TrackHostPage(page + i * 4096);
     h->next = g_allocator.pages;
     g_allocator.pages = h;
   }
+  cookie = TrackHostPage(page);
   UNLOCK(&g_allocator.lock);
 Finished:
   s->rss += 1;
-  i = TrackHostPage(page);
-  unassert(!(i & ~PAGE_TA));
-  return i | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V;
+  unassert(!(cookie & ~PAGE_TA));
+  return cookie | PAGE_HOST | PAGE_U | PAGE_RW | PAGE_V;
 }
 
 u64 AllocatePageTable(struct System *s) {
@@ -659,7 +673,7 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
     unassert(~entry & PAGE_RSRV);
     s->memstat.committed -= 1;
     ClearPage((page = FindHostPage(entry)));
-    FreeAnonymousPage(s, page);
+    FreeAnonymousPage(s, page, entry & PAGE_TA);
     --*rss_delta;
     return false;
   } else if ((entry & (PAGE_HOST | PAGE_MAP | PAGE_MUG)) ==
@@ -768,7 +782,10 @@ static void RemoveVirtual(struct System *s, i64 virt, i64 size,
         // crawl an old pointer to a free page table. free page
         // tables may be crawled because they always get zero'd
         // before being put into a freelist fifo that cools off
-        FreePageTable(s, GetPageAddress(s, LoadPte(pde), i == 39));
+        {
+          u64 e = LoadPte(pde);
+          FreePageTable(s, GetPageAddress(s, e, i == 39), e & PAGE_TA);
+        }
         StorePte(pde, 0);
       }
       break;
