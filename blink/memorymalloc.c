@@ -86,6 +86,14 @@ static u64 TrackHostPage(u8 *ptr) {
   }
   LOCK(&g_hostpages_lock);
   p = atomic_load_explicit(&g_hostpages.p, memory_order_relaxed);
+  if (g_hostpages.nfree) {
+    // Reuse a slot freed by ReleaseHostPage() (e.g. an unmapped PAGE_MUG file
+    // page) instead of growing the table.
+    entry = g_hostpages.freeidx[--g_hostpages.nfree];
+    p[entry] = ptr;
+    UNLOCK(&g_hostpages_lock);
+    return entry << 12;
+  }
   if (g_hostpages.n == g_hostpages.c) {
     size_t nc = g_hostpages.c + (g_hostpages.c >> 1) + 16;
     u8 **np = (u8 **)malloc(nc * sizeof(*np));
@@ -100,6 +108,27 @@ static u64 TrackHostPage(u8 *ptr) {
   g_hostpages.n = entry + 1;
   UNLOCK(&g_hostpages_lock);
   return entry << 12;
+}
+
+// Returns a g_hostpages slot to the reusable-index stack. Called when a tracked
+// host page's backing memory is permanently released (PAGE_MUG file mappings
+// that get munmap'd) so its index can be reused rather than leaked. The PTE
+// referencing it has been cleared by the caller and the TLBs are invalidated at
+// the end of the enclosing FreeVirtual(), so no live PTE/TLB entry resolves to
+// this slot once it is handed out again. (Anonymous pages reuse their slot via
+// the allocator free list's cached cookie instead, so they don't come here.)
+static void ReleaseHostPage(u64 cookie) {
+  if (HasLinearMapping()) return;
+  LOCK(&g_hostpages_lock);
+  if (g_hostpages.nfree == g_hostpages.cfree) {
+    size_t nc = g_hostpages.cfree + (g_hostpages.cfree >> 1) + 16;
+    size_t *nf = (size_t *)realloc(g_hostpages.freeidx, nc * sizeof(*nf));
+    unassert(nf);
+    g_hostpages.freeidx = nf;
+    g_hostpages.cfree = nc;
+  }
+  g_hostpages.freeidx[g_hostpages.nfree++] = (size_t)(cookie >> 12);
+  UNLOCK(&g_hostpages_lock);
 }
 
 // Returns a host page to the free list. `cookie` is the page's PAGE_TA bits
@@ -683,6 +712,7 @@ static bool FreePage(struct System *s, i64 virt, u64 entry, u64 size,
     real = mug = FindHostPage(entry);
     while ((uintptr_t)mug & (pagesize - 1)) mug -= 4096;
     unassert(!Munmap(mug, real - mug + size));
+    ReleaseHostPage(entry & PAGE_TA);  // reclaim the slot; backing is gone
     if (entry & PAGE_RSRV) {
       s->memstat.reserved -= 1;
     } else {

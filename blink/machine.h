@@ -170,6 +170,9 @@ struct HostPages {
   size_t n;                 // [guarded by g_hostpages_lock]
   size_t c;                 // [guarded by g_hostpages_lock]
   _Atomicish(u8 **) p;      // published w/ release; read lock-free by FindHostPage
+  size_t *freeidx;          // [g_hostpages_lock] stack of reusable slot indices
+  size_t nfree;             // [g_hostpages_lock]
+  size_t cfree;             // [g_hostpages_lock]
 };
 
 struct PageLock {
