@@ -397,11 +397,11 @@ int CopyFromUserRead(struct Machine *m, void *dst, i64 addr, u64 n) {
   return 0;
 }
 
-int CopyToUser(struct Machine *m, i64 dst, void *src, u64 n) {
+int CopyToUser(struct Machine *m, i64 dst, const void *src, u64 n) {
   return VirtualCopy(m, dst, (char *)src, n, false);
 }
 
-int CopyToUserWrite(struct Machine *m, i64 addr, void *src, u64 n) {
+int CopyToUserWrite(struct Machine *m, i64 addr, const void *src, u64 n) {
   if (CopyToUser(m, addr, src, n) == -1) return -1;
   SetWriteAddr(m, addr, n);
   return 0;
