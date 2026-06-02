@@ -7404,6 +7404,19 @@ static int SysFreeBSDSigprocmask(struct Machine* m, int how, i64 set,
   return SysSigprocmask(m, how - 1, set, oset, 8);
 }
 
+// FreeBSD sigpending(sigset_t *set): report signals pending delivery. FreeBSD's
+// sigset_t is 16 bytes (4 x u32); blink tracks pending signals in m->signals,
+// whose low 8 bytes cover signals 1-64 (FreeBSD only uses 1-32 in practice).
+// Mirror SysSigpending() but emit the full 16-byte set with the upper words
+// zeroed. Mask bits are treated as bit-compatible with Linux, consistent with
+// SysFreeBSDSigprocmask above.
+static int SysFreeBSDSigpending(struct Machine *m, i64 setaddr) {
+  u8 set[16];
+  Write64(set, m->signals);
+  Write64(set + 8, 0);
+  return CopyToUserWrite(m, setaddr, set, sizeof(set));
+}
+
 // FreeBSD sigsuspend takes a 4-byte sigset_t* (not 8-byte like Linux).
 // Read 4 bytes and zero-extend to 8 for compatibility.
 static int SysFreeBSDSigsuspend(struct Machine* m, i64 maskaddr) {
@@ -9859,6 +9872,7 @@ void OpSyscall(P) {
         ax = 0x0ED;
         break;  // sigprocmask
       case 341: ax = 0x200; break;  // sigsuspend
+      case 343: ax = 0x251; break;  // sigpending
       case 342:
         ax = 0x1FB;
         break;  // __sys_sigaction
@@ -10569,6 +10583,7 @@ void OpSyscall(P) {
     SYSCALL(1, 0x23d, "shm_unlink", SysFreeBSDShmUnlink, STRACE_1);
     SYSCALL(2, 392, "uuidgen", SysFreeBSDUuidgen, STRACE_2);
     SYSCALL(1, 0x200, "sigsuspend", SysFreeBSDSigsuspend, STRACE_1);
+    SYSCALL(1, 0x251, "sigpending", SysFreeBSDSigpending, STRACE_1);
     SYSCALL(4, 0x246, "__realpathat", SysFreeBSDRealpathat, STRACE_4);
     SYSCALL(5, 0x247, "_umtx_op", SysFreeBSD_umtx_op, STRACE_5);
     SYSCALL(1, 0x248, "thr_wake", SysFreeBSDThrWake, STRACE_1);
