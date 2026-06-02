@@ -2251,6 +2251,18 @@ void Actor(struct Machine *mm) {
 #ifndef __CYGWIN__
     STATISTIC(++interps);
 #endif
+#ifdef HAVE_JIT
+    // Quiescent point for JIT block reclamation (QSBR): here, between dispatch
+    // iterations, this thread is provably not executing inside any JIT block
+    // (the previous func() has fully returned). Publish the current reclaim
+    // epoch so a thread retiring blocks knows we've left anything older.
+    // Release-ordered so our prior reads of JIT code happen-before a reclaimer
+    // observing this and reusing the storage.
+    atomic_store_explicit(
+        &m->jitqso,
+        atomic_load_explicit(&m->system->jit.reclaimepoch, memory_order_relaxed),
+        memory_order_release);
+#endif
     if (!atomic_load_explicit(&m->attention, memory_order_acquire)) {
       ExecuteInstruction(m);
     } else {

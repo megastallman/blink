@@ -355,6 +355,7 @@ struct Machine {               //
   struct XedMachineMode mode;  // [dup] XED_MACHINE_MODE_REAL etc.
   bool threaded;               // must use synchronization
   _Atomic(bool) attention;     // signals main interpreter loop
+  _Atomic(unsigned) jitqso;    // reclaimepoch last seen at Actor() quiescence
   u32 flags;                   // x86 eflags register
   i64 stashaddr;               // it's our page overlap buffer
   union {                      // GENERAL REGISTER FILE

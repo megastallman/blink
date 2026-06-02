@@ -819,18 +819,30 @@ void AddPath_EndOp(P) {
     AppendJitMovReg(m->path.jb, kJitArg0, kJitSav0);
     u8 sa = offsetof(struct Machine, stashaddr);
     u8 code[] = {
-        // cmpq $0x0,0x18(%rdi)
+        // cmpq $0x0,sa(%rdi)
         0x48 | (kJitArg0 > 7 ? kAmdRexb : 0),
         0x83,
         0170 | (kJitArg0 & 7),
         sa,
         0x00,
-        // jz +5
+        // jz <past the CommitStash call>; rel8 is backpatched below because
+        // AppendJitCall() emits a 5-byte `call rel32` when CommitStash is
+        // within +/-2GB but a ~12-byte `movabs $addr,%rax; call %rax` when
+        // it's farther. A hardcoded +5 lands mid-instruction for the far
+        // form and executes garbage. This only triggers under -m (the stash
+        // path) and only when ASLR places the JIT mmap >2GB from the blink
+        // binary, which is why it was an intermittent, -m-only SIGSEGV.
         0x74,
-        0x05,
+        0x00,
     };
-    AppendJit(m->path.jb, code, sizeof(code));
-    AppendJitCall(m->path.jb, (void *)(uintptr_t)CommitStash);
+    if (AppendJit(m->path.jb, code, sizeof(code))) {
+      long disp_at = m->path.jb->index - 1;  // the rel8 byte just written
+      if (AppendJitCall(m->path.jb, (void *)(uintptr_t)CommitStash)) {
+        long skip = m->path.jb->index - (disp_at + 1);  // actual call length
+        unassert(skip >= 0 && skip <= 127);
+        m->path.jb->addr[disp_at] = (u8)skip;
+      }
+    }
   }
 #elif !LOG_JIX && defined(__aarch64__)
   if (m->reserving) {

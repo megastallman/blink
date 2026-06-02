@@ -290,6 +290,7 @@ struct System *NewSystem(struct XedMachineMode mode) {
   }
 #ifdef HAVE_JIT
   InitJit(&s->jit, (uintptr_t)JitlessDispatch);
+  s->jit.system = s;  // back-pointer for QSBR quiescence scan
 #endif
   InitFds(&s->fds);
   unassert(!pthread_mutex_init(&s->sig_lock, 0));
@@ -344,6 +345,30 @@ bool IsOrphan(struct Machine *m) {
   UNLOCK(&m->system->machines_lock);
   return res;
 }
+
+#ifdef HAVE_JIT
+// Returns the minimum reclaim epoch observed across all live guest threads at
+// their Actor() quiescent point. A JIT block retired at epoch E becomes safe to
+// reuse once this floor reaches E (every thread has since left any pre-E block).
+// Takes machines_lock only; the caller MUST NOT hold jit->lock (machines_lock
+// is the outer lock — see the fork() handler in OpFork).
+unsigned GetJitQuiescenceFloor(struct Jit *jit) {
+  struct Dll *e;
+  struct Machine *m;
+  struct System *s = jit->system;
+  unsigned floor, q;
+  // no thread can have published beyond the current epoch, so start there
+  floor = atomic_load_explicit(&jit->reclaimepoch, memory_order_acquire);
+  LOCK(&s->machines_lock);
+  for (e = dll_first(s->machines); e; e = dll_next(s->machines, e)) {
+    m = MACHINE_CONTAINER(e);
+    q = atomic_load_explicit(&m->jitqso, memory_order_acquire);
+    if ((int)(q - floor) < 0) floor = q;  // floor = min(floor, q), wrap-safe
+  }
+  UNLOCK(&s->machines_lock);
+  return floor;
+}
+#endif
 
 void KillOtherThreads(struct System *s) {
 #ifdef HAVE_THREADS
@@ -464,6 +489,16 @@ struct Machine *NewMachine(struct System *system, struct Machine *parent) {
     m->tid = m->system->pid;
   }
   dll_init(&m->elem);
+#ifdef HAVE_JIT
+  // Start quiesced at the current reclaim epoch so this thread neither pegs the
+  // reclamation floor at 0 nor is wrongly treated as having passed a later
+  // epoch's retirement. It hasn't run any guest (let alone JIT) code yet, so
+  // any epoch value <= current is safe; it republishes at Actor() once running.
+  atomic_store_explicit(
+      &m->jitqso,
+      atomic_load_explicit(&system->jit.reclaimepoch, memory_order_relaxed),
+      memory_order_relaxed);
+#endif
   // TODO(jart): Child thread should add itself to system.
   dll_make_first(&system->machines, &m->elem);
   UNLOCK(&system->machines_lock);

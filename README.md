@@ -19,9 +19,9 @@ The most important terminal utilities, curl, wget, mc, nano, gcc, w, python3.11,
 - git checkout FREEBSD_AI
 - make
 - ./freebsd-bootstrap.sh --dest ~/freebsd-test
-- ~/blink/o/blink/blink -m -R -C ~/freebsd-test /bin/sh
+- ~/blink/o/blink/blink -R -C ~/freebsd-test /bin/sh
 
-Within the FreeBSD shell you may start with `uname`, `pkg update`, `pkg upgrade`, `pkg install mc`, and whatever else you may need. Also you may run programs sepatately: `~/blink/o/blink/blink -m -R -C ~/freebsd-test /usr/local/bin/python3.11`. To run without root emulation, please drop `-R` flag.
+Within the FreeBSD shell you may start with `uname`, `pkg update`, `pkg upgrade`, `pkg install mc`, `pkg install thunar xeyes`, and whatever else you may need. Also you may run programs sepatately: `~/blink/o/blink/blink -R -C ~/freebsd-test /usr/local/bin/python3.11`. To run without root emulation, please drop `-R` flag.
 
 
 # The original README text goes below
