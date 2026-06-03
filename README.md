@@ -1,6 +1,6 @@
 # Blink FreeBSD fork
 
-This is a fork of the greatest project by JART(Justine Tunney), slightly enhanced with AI tools. Spetial thanks to the author.
+This is a fork of the greatest project by JART(Justine Tunney), slightly enhanced with AI tools. Special thanks to the author.
 
 ## Functionality added
 
@@ -21,10 +21,10 @@ The most important terminal utilities, curl, wget, mc, nano, gcc, w, python3.11,
 - ./freebsd-bootstrap.sh --dest ~/freebsd-test
 - ~/blink/o/blink/blink -R -C ~/freebsd-test /bin/sh
 
-Within the FreeBSD shell you may start with `uname`, `pkg update`, `pkg upgrade`, `pkg install mc`, `pkg install thunar xeyes`, and whatever else you may need. Also you may run programs sepatately: `~/blink/o/blink/blink -R -C ~/freebsd-test /usr/local/bin/python3.11`. To run without root emulation, please drop `-R` flag.
+Within the FreeBSD shell you may start with `uname`, `pkg update`, `pkg upgrade`, `pkg install mc thunar xeyes`, and whatever else you may need. Also you may run programs sepatately: `~/blink/o/blink/blink -R -C ~/freebsd-test /usr/local/bin/python3.11`. To run without root emulation, please drop `-R` flag.
 
 
-# The original README text goes below
+# The original README text goes below:
 
 ![Screenshot of Blink running GCC 9.4.0](blink/blink-gcc.png)
 

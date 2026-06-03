@@ -2283,6 +2283,13 @@ void Blink(struct Machine *m) {
     m->canhalt = false;
     m->nofault = false;
     m->insyscall = false;
+    if (m->crosslocked) {
+      // a fault unwound past CommitStash() while we held the page-crossing bus
+      // lock; release it (same thread) so the location doesn't deadlock.
+      UnlockBus((const u8 *)(uintptr_t)m->stashaddr);
+      m->crosslocked = false;
+    }
+    m->stashaddr = 0;
     CollectPageLocks(m);
     CollectGarbage(m, 0);
     if (IsMakingPath(m)) {

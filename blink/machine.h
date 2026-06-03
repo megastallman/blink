@@ -358,6 +358,7 @@ struct Machine {               //
   _Atomic(unsigned) jitqso;    // reclaimepoch last seen at Actor() quiescence
   u32 flags;                   // x86 eflags register
   i64 stashaddr;               // it's our page overlap buffer
+  bool crosslocked;            // [stashaddr] holding bus lock for crossing op
   union {                      // GENERAL REGISTER FILE
     u64 align8_;               //
     u8 beg[128];               //
