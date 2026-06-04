@@ -380,6 +380,7 @@ struct fbsd_termios {
 #define FBSD_TIOCSPGRP  0x80047476u
 #define FBSD_TIOCDRAIN  0x2000745eu
 #define FBSD_TIOCFLUSH  0x80047410u
+#define FBSD_TIOCSCTTY  0x20007461u  // _IO('t', 97) acquire controlling tty
 
 static u32 LinuxToFreeBSDIflag(u32 x) {
   // Most bits identical; IXON and IXOFF differ
@@ -683,6 +684,15 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlTiocgpgrp(m, fildes, addr);
     case FBSD_TIOCSPGRP:
       return IoctlTiocspgrp(m, fildes, addr);
+    case TIOCSCTTY_LINUX:   // Linux TIOCSCTTY (0x540e)
+    case FBSD_TIOCSCTTY:    // FreeBSD TIOCSCTTY (0x20007461)
+      // Acquire the pty as controlling terminal. blink backs guest ptys with
+      // real host ptys and runs guest processes as real host processes, so
+      // after the guest's setsid() a host TIOCSCTTY makes job control work
+      // (TIOCGPGRP/TIOCSPGRP via tcgetpgrp/tcsetpgrp then succeed). Without it,
+      // shells print "cannot set terminal process group / no job control" and
+      // mc's subshell sync stalls ~10s waiting for a reply that never comes.
+      return VfsIoctl(fildes, TIOCSCTTY, (void *)0L);
     case FBSD_TIOCDRAIN:
       return VfsIoctl(fildes, TCSBRK, (void *)1L);
     case FBSD_TIOCFLUSH:
