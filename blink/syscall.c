@@ -8609,6 +8609,20 @@ static int SysFreeBSDSysctl(struct Machine* m, i64 nameaddr, u32 namelen,
   u32 readlen = namelen < 6 ? namelen : 6;
   memset(name, 0, sizeof(name));
   if (CopyFromUserRead(m, name, nameaddr, readlen * 4) == -1) return -1;
+  if (name[0] == 8 /* CTL_USER */) {
+    if (name[1] == 1 /* USER_CS_PATH */) {
+      // confstr(_CS_PATH): the default utility search path. whereis(1) and
+      // other tools read this; include /usr/local so pkg-installed binaries
+      // (e.g. mc) are findable. Callers size the buffer via a first oldaddr=0
+      // query, matching the other string sysctls here.
+      static const char kCsPath[] =
+          "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/usr/local/sbin";
+      u64 len = sizeof(kCsPath);  // includes the NUL terminator
+      if (oldaddr && CopyToUserWrite(m, oldaddr, kCsPath, len) == -1) return -1;
+      if (oldlenaddr && CopyToUserWrite(m, oldlenaddr, &len, 8) == -1) return -1;
+      return 0;
+    }
+  }
   if (name[0] == 4 /* CTL_NET */) {
     if (name[1] == 17 /* PF_ROUTE */) {
       // NET_RT_IFLISTL / routing table from getifaddrs()
