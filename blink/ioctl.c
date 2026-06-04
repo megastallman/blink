@@ -380,6 +380,8 @@ struct fbsd_termios {
 #define FBSD_TIOCSPGRP  0x80047476u
 #define FBSD_TIOCDRAIN  0x2000745eu
 #define FBSD_TIOCFLUSH  0x80047410u
+#define FBSD_TIOCGETD   0x4004741au  // get line discipline
+#define FBSD_TIOCSETD   0x8004741bu  // set line discipline
 
 static u32 LinuxToFreeBSDIflag(u32 x) {
   // Most bits identical; IXON and IXOFF differ
@@ -683,6 +685,12 @@ int SysIoctl(struct Machine *m, int fildes, u64 request, i64 addr) {
       return IoctlTiocgpgrp(m, fildes, addr);
     case FBSD_TIOCSPGRP:
       return IoctlTiocspgrp(m, fildes, addr);
+    case FBSD_TIOCGETD:  // line discipline number (TTYDISC/N_TTY=0 for a tty)
+      return IoctlGetInt32(m, fildes, TIOCGETD, addr);
+#ifdef TIOCSETD
+    case FBSD_TIOCSETD:
+      return IoctlSetInt32(m, fildes, TIOCSETD, addr);
+#endif
     // NB: TIOCSCTTY is deliberately NOT implemented. Making it succeed lets a
     // shell believe it has job control, but blink can't deliver the rest of the
     // job-control machinery (process-group SIGSTOP/SIGCONT + waitpid(WUNTRACED)
