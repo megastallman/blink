@@ -9704,9 +9704,17 @@ void OpSyscall(P) {
       case 33:
         ax = 0x15;
         break;  // access
-      case 37:
+      case 37: {
+        // kill(pid, sig): translate the FreeBSD signal NUMBER to Linux. Without
+        // this, signals that differ between the OSes (e.g. FreeBSD SIGSTOP=17,
+        // SIGCONT=19, SIGCHLD=20 vs Linux 19/18/17) are sent wrong -- notably
+        // `kill -STOP` became "send SIGCHLD", so a shell's `kill -STOP $$`
+        // never stopped it and mc's subshell job-control sync hung forever.
+        i64 fsig = Get64(m->si);
+        if (fsig > 0) Put64(m->si, XlatFreeBSDSignal(fsig));
         ax = 0x3e;
         break;  // kill
+      }
       case 39:
         ax = 0x6e;
         break;  // getppid
