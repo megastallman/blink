@@ -3090,14 +3090,9 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
   struct dirent *ent;
   struct dirent_linux rec;
   if (size < sizeof(rec) - sizeof(rec.name)) return einval();
+  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
   if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
-  // O_DIRECTORY is only an open-time hint, not required to read a directory:
-  // on FreeBSD/Linux you may open(dir, O_RDONLY) and getdents/getdirentries it.
-  // Gate on the fd's ACTUAL type so directories opened without O_DIRECTORY work
-  // (e.g. libc's physical getcwd opening ".." with plain O_RDONLY, which mc's
-  // subshell relies on). Previously this wrongly returned ENOTDIR.
-  if (!S_ISDIR(st.st_mode)) return enotdir();
   if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
     return -1;
   }
@@ -3169,14 +3164,9 @@ static i64 GetFreeBSDdents(struct Machine* m, i32 fildes, i64 addr, i64 size,
   struct dirent* ent;
   u8 rec[512];
   if (size < 24) return einval();
+  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
   if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
-  // O_DIRECTORY is only an open-time hint, not required to read a directory:
-  // on FreeBSD/Linux you may open(dir, O_RDONLY) and getdents/getdirentries it.
-  // Gate on the fd's ACTUAL type so directories opened without O_DIRECTORY work
-  // (e.g. libc's physical getcwd opening ".." with plain O_RDONLY, which mc's
-  // subshell relies on). Previously this wrongly returned ENOTDIR.
-  if (!S_ISDIR(st.st_mode)) return enotdir();
   if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) return -1;
   for (i = 0; i + 24 <= size; i += reclen) {
     long tell;
