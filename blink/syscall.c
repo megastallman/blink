@@ -2660,6 +2660,41 @@ static int SysGetsockopt(struct Machine *m, i32 fildes, i32 level, i32 optname,
   return rc;
 }
 
+// Debug aid: when env BLINK_KEYLOG=<path> is set, every read() that returns
+// bytes from a tty is appended to that file as one hex line. Used to capture
+// exactly what bytes a TUI (e.g. mc) receives per keypress. Off by default; the
+// log fd is moved to the blink-reserved high range so it can't collide with a
+// guest fd.
+static _Atomic(int) g_keylog_fd = -2;  // -2=uninit, -1=disabled, else host fd
+static void KeyLog(int fildes, const struct Iovs *iv, i64 rc) {
+  int kf = atomic_load_explicit(&g_keylog_fd, memory_order_relaxed);
+  if (kf == -2) {
+    const char *p = getenv("BLINK_KEYLOG");
+    int nf = -1;
+    if (p && *p) {
+      int t = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+      if (t != -1) {
+        nf = fcntl(t, F_DUPFD_CLOEXEC, kMinBlinkFd);
+        close(t);
+      }
+    }
+    atomic_store_explicit(&g_keylog_fd, nf, memory_order_relaxed);
+    kf = nf;
+  }
+  if (kf < 0 || rc <= 0 || iv->i == 0) return;
+  if (!isatty(fildes)) return;
+  char line[160];
+  int o = snprintf(line, sizeof(line), "fd%d read %ld:", fildes, (long)rc);
+  const unsigned char *b = (const unsigned char *)iv->p[0].iov_base;
+  i64 n = rc < (i64)iv->p[0].iov_len ? rc : (i64)iv->p[0].iov_len;
+  if (n > 48) n = 48;
+  for (i64 i = 0; i < n && o < (int)sizeof(line) - 4; ++i) {
+    o += snprintf(line + o, sizeof(line) - o, " %02x", b[i]);
+  }
+  if (o < (int)sizeof(line) - 1) line[o++] = '\n';
+  (void)!write(kf, line, o);
+}
+
 static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
   i64 rc;
   int oflags;
@@ -2684,6 +2719,7 @@ static i64 SysRead(struct Machine *m, i32 fildes, i64 addr, u64 size) {
     if ((rc = AppendIovsReal(m, &iv, addr, size, PROT_WRITE)) != -1) {
       RESTARTABLE(rc = readv_impl(fildes, iv.p, iv.i));
       if (rc != -1) SetWriteAddr(m, addr, rc);
+      KeyLog(fildes, &iv, rc);
     }
     FreeIovs(&iv);
   } else {
@@ -3090,9 +3126,12 @@ static i64 Getdents(struct Machine *m, i32 fildes, i64 addr, i64 size,
   struct dirent *ent;
   struct dirent_linux rec;
   if (size < sizeof(rec) - sizeof(rec.name)) return einval();
-  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
   if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
+  // O_DIRECTORY is only an open-time hint; a directory may be opened O_RDONLY
+  // and read (FreeBSD libc's physical getcwd() opens ".." O_RDONLY then
+  // getdirentries). Gate on the fd's ACTUAL type, not the open flag.
+  if (!S_ISDIR(st.st_mode)) return enotdir();
   if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) {
     return -1;
   }
@@ -3164,9 +3203,11 @@ static i64 GetFreeBSDdents(struct Machine* m, i32 fildes, i64 addr, i64 size,
   struct dirent* ent;
   u8 rec[512];
   if (size < 24) return einval();
-  if ((fd->oflags & O_DIRECTORY) != O_DIRECTORY) return enotdir();
   if (!IsValidMemory(m, addr, size, PROT_WRITE)) return -1;
   if (VfsFstat(fildes, &st) || !st.st_nlink) return enoent();
+  // O_DIRECTORY is only an open-time hint; gate on the fd's ACTUAL type so a
+  // directory opened O_RDONLY (e.g. getcwd walking "..") can be read.
+  if (!S_ISDIR(st.st_mode)) return enotdir();
   if (!fd->dirstream && !(fd->dirstream = VfsOpendir(fd->fildes))) return -1;
   for (i = 0; i + 24 <= size; i += reclen) {
     long tell;
